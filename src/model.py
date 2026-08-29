@@ -156,8 +156,17 @@ class NAFNet_UNet(nn.Module):
 
 
 @register("nafnet")
-def _nafnet(scale=2, **kwargs):
-    return NAFNet_UNet(in_channels=1, out_channels=1, dim=64, scale=scale)
+def _nafnet(scale=2, dim=64, **kwargs):
+    """Width is configurable so capacity can be swept.
+
+    Parameters scale roughly as dim^2 (each NAFBlock is ~7c^2 weights):
+        dim=48  -> ~0.55M      dim=64  -> ~0.98M   (round-2 baseline)
+        dim=96  -> ~2.2M       dim=128 -> ~3.9M
+
+    Inference throughput is scored, so measure runtime alongside quality
+    rather than assuming a bigger model is a better submission.
+    """
+    return NAFNet_UNet(in_channels=1, out_channels=1, dim=int(dim), scale=scale)
 
 
 @register("bicubic")

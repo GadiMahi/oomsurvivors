@@ -93,6 +93,12 @@ baseline:
     ssim_flat: 0.4784
     lpips: 0.4839
 
+model:
+  name: nafnet
+  dim: 64                # channel width. params ~ dim^2:
+                         #   48 -> 0.55M | 64 -> 0.98M | 96 -> 2.2M | 128 -> 3.9M
+                         # inference time is scored - measure it, don't assume
+
 train:
   seed: 1337
   batch_size: 32

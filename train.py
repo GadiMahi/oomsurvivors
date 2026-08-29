@@ -199,7 +199,9 @@ def main() -> int:
     val_loader = DataLoader(val_ds, batch_size=cfg.get_path("train.val_batch_size", 8),
                             shuffle=False, num_workers=nw, pin_memory=True)
 
-    model = build_model("nafnet", scale=cfg.get_path("dataset.scale", 2)).to(device)
+    model = build_model(cfg.get_path("model.name", "nafnet"),
+                        scale=cfg.get_path("dataset.scale", 2),
+                        dim=cfg.get_path("model.dim", 64)).to(device)
     n_par = sum(p.numel() for p in model.parameters())
     print(f"model: nafnet, {n_par/1e6:.2f}M parameters")
 
