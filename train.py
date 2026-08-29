@@ -82,7 +82,12 @@ class SobelEdgeLoss(nn.Module):
         gx, gy = self._grad(target)
         g = torch.sqrt(gx ** 2 + gy ** 2)
         m = g.amax(dim=(-2, -1), keepdim=True).clamp_min(1e-8)
-        return 1.0 + alpha * (g / m)
+        w = 1.0 + alpha * (g / m)
+        # Normalise to mean 1 so the weighting changes WHERE loss is applied
+        # without changing its overall scale. Without this the loss is ~2.5x
+        # larger than plain Charbonnier, which silently rescales the effective
+        # learning rate on that term.
+        return w / w.mean(dim=(-2, -1), keepdim=True).clamp_min(1e-8)
 
 
 # --------------------------------------------------------------------------- metrics
@@ -263,8 +268,9 @@ def main() -> int:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), clip)
             scaler.step(opt)
             scaler.update()
-            tot += float(loss)
-            pbar.set_postfix(loss=f"{float(loss):.4f}", w=f"{w:.2f}")
+            lv = float(loss.detach())
+            tot += lv
+            pbar.set_postfix(loss=f"{lv:.4f}", w=f"{w:.2f}")
 
         sched.step()
         train_loss = tot / max(1, len(train_loader))
