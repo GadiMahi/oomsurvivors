@@ -210,7 +210,13 @@ class RestorationDataset(Dataset):
         """
         rng = self._ensure_rng()
         s, m = self.scale, self.margin
-        gt = scale_jitter(gt_full, rng, *self.jitter_range)
+
+        # Bicubic rescaling overshoots slightly at sharp edges, so the jittered
+        # GT can land marginally outside [0,1]. Real ground truth never does, and
+        # an unclipped target asks the model to predict impossible values. Clip
+        # the TARGET only - the degraded input keeps its out-of-range values,
+        # which are genuine signal about the speckle process.
+        gt = np.clip(scale_jitter(gt_full, rng, *self.jitter_range), 0.0, 1.0)
 
         hr_size = self.lr_patch * s
         crop = self._crop_hr(gt, hr_size + 2 * m)

@@ -27,7 +27,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from src.config import add_config_args, load_config          # noqa: E402
 from src.io_utils import (detect_format, load_image, list_images,  # noqa: E402
                           pair_by_stem, round_trip_check)
-from src.transforms import save_stats                         # noqa: E402
+from src.transforms import load_stats, save_stats             # noqa: E402
 
 
 def main() -> int:
@@ -109,7 +109,10 @@ def main() -> int:
     print("   Keep scale_constant=1.0. Per-image normalisation is the classic")
     print("   out-of-distribution failure mode and there is nothing to gain here.")
 
-    stats = {
+    # MERGE, never replace. stats.json also carries the fitted noise model,
+    # kernel weights, order_mix and baseline numbers measured elsewhere -
+    # overwriting it silently reverts degrade() to placeholder defaults.
+    measured = {
         "scale_constant": 1.0,
         "log_transform": False,
         "log_eps": 0.01,
@@ -119,10 +122,17 @@ def main() -> int:
         "n_pairs": len(pairs),
         "cv_image_means": cv,
         "frac_lr_above_1": float(df.frac_above1.mean()),
+        "frac_lr_below_0": float(df.frac_below0.mean()),
     }
+    stats = {**load_stats(), **measured}
     save_stats(stats)
+
     print(f"\nwrote artifacts/stats.json and artifacts/inventory.csv")
-    print(json.dumps({k: v for k, v in stats.items() if k != "gt_format"}, indent=2))
+    print(json.dumps(measured, indent=2))
+    preserved = [k for k in ("noise_var_fit", "kernels", "order_mix", "meas_mult",
+                             "baseline_bicubic", "grad_thresh_gt_p40") if k in stats]
+    if preserved:
+        print(f"preserved from previous runs: {preserved}")
     return 0 if rt["passed"] else 1
 
 
