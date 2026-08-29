@@ -172,7 +172,12 @@ class RestorationDataset(Dataset):
         for _ in range(self.crop_tries):
             y = int(rng.integers(0, H - p + 1))
             x = int(rng.integers(0, W - p + 1))
-            e = _grad_energy(lr[y:y + p, x:x + p])
+            # Measure structure on the CLEAN patch. Round-2 analysis showed noise
+            # roughly doubles apparent gradient energy on the LR image (median
+            # 0.263 vs 0.133 on GT), so selecting on LR selects on the noise
+            # realisation rather than on content - which makes rejection
+            # sampling equivalent to uniform random sampling.
+            e = _grad_energy(gt[y * s:(y + p) * s, x * s:(x + p) * s])
             if e >= self.grad_thresh:
                 best = (e, y, x)
                 break
@@ -196,18 +201,29 @@ class RestorationDataset(Dataset):
         }
 
 
-def estimate_grad_threshold(cache_dir, percentile=40, lr_patch=64, n=2000, seed=0) -> float:
-    """Measure the crop-gradient distribution instead of guessing a threshold."""
+def estimate_grad_threshold(cache_dir, percentile=40, lr_patch=64, scale=2,
+                            n=2000, seed=0) -> float:
+    """Measure the crop-gradient distribution on the CLEAN (GT) patches.
+
+    Must match what _crop measures, otherwise the threshold is on the wrong
+    scale entirely. Measuring on noisy LR patches inflates the values (noise
+    contributes gradient of its own) and the resulting threshold rejects
+    nothing useful.
+
+    Round-2 reference values, GT 128px crops:
+        p10 0.052 · p25 0.094 · p40 0.122 · p50 0.140 · p75 0.184 · p90 0.223
+    """
     ds = RestorationDataset(cache_dir, lr_patch=lr_patch, train=False, seed=seed)
     rng = np.random.default_rng(seed)
+    hr_patch = lr_patch * scale
     vals = []
     for _ in range(n):
         gi, i, _ = ds.items[int(rng.integers(0, len(ds.items)))]
-        _, lr = ds._read(gi, i)
-        H, W = lr.shape
-        if H <= lr_patch or W <= lr_patch:
+        gt, _ = ds._read(gi, i)
+        H, W = gt.shape
+        if H <= hr_patch or W <= hr_patch:
             continue
-        y = int(rng.integers(0, H - lr_patch + 1))
-        x = int(rng.integers(0, W - lr_patch + 1))
-        vals.append(_grad_energy(lr[y:y + lr_patch, x:x + lr_patch]))
+        y = int(rng.integers(0, H - hr_patch + 1))
+        x = int(rng.integers(0, W - hr_patch + 1))
+        vals.append(_grad_energy(gt[y:y + hr_patch, x:x + hr_patch]))
     return float(np.percentile(vals, percentile)) if vals else 0.0

@@ -1,0 +1,77 @@
+{
+  "_comment": "Round 2 (SEM micrographs). Measured on 1325 verified pairs. See docs/ROUND2_EDA.md.",
+  "dataset": "semicon_train_data",
+  "round": 2,
+
+  "scale_constant": 1.0,
+  "log_transform": false,
+  "log_eps": 0.01,
+  "gt_valid_range": [0.0, 1.0],
+
+  "gt_format": {
+    "kind": "npy",
+    "suffix": ".npy",
+    "dtype": "float32",
+    "scale": 1.0
+  },
+
+  "n_pairs": 1325,
+  "n_gt_total": 4785,
+  "n_gt_only": 3460,
+  "cv_image_means": 0.2580,
+  "frac_lr_above_1": 0.01838,
+  "frac_lr_below_0": 0.00088,
+
+  "downsample_kernel": "randomised",
+  "kernels": ["area", "bicubic_aa", "lanczos", "bilinear_aa"],
+  "kernel_p": [0.3, 0.3, 0.2, 0.2],
+  "kernel_scores": {
+    "area": 1.8016e-04,
+    "bicubic_aa": 1.8189e-04,
+    "lanczos": 1.8196e-04,
+    "bilinear_aa": 1.8296e-04,
+    "nearest": 2.7286e-04
+  },
+  "kernel_spread_pct": 1.55,
+
+  "order_mix": [0.1, 0.9],
+  "noise_autocorr_lag1": [-0.0500, -0.0516],
+
+  "noise_var_fit": {
+    "a_mult": 2.5071e-02,
+    "b_poisson": 9.5974e-03,
+    "c_additive": 0.0
+  },
+  "meas_mult": 0.1583,
+  "meas_add": 0.0,
+  "residual_std": 0.10810,
+  "residual_skew": 0.5152,
+  "residual_excess_kurtosis": 2.0798,
+  "tail_frac_3sigma": 0.011412,
+  "tail_frac_5sigma": 0.0005295,
+  "overshoot_pred_vs_meas_ratio": 1.11,
+
+  "grad_thresh_gt_p40": 0.1222,
+  "grad_percentiles_gt": {
+    "p10": 0.0520, "p25": 0.0941, "p40": 0.1222,
+    "p50": 0.1403, "p75": 0.1837, "p90": 0.2228
+  },
+
+  "baseline_bicubic": {
+    "psnr": 20.4706,
+    "ssim": 0.5079,
+    "ssim_edge": 0.5964,
+    "ssim_flat": 0.4784,
+    "lpips": 0.4839
+  },
+
+  "round1_reference": {
+    "meas_mult": 0.1431,
+    "noise_var_fit": {"a_mult": 2.0470e-02, "b_poisson": 5.8440e-03, "c_additive": 0.0},
+    "residual_std": 0.083,
+    "baseline_bicubic": {"psnr": 22.70, "ssim": 0.553, "lpips": 0.427},
+    "note": "Natural photographs, not comparable to round-2 scores."
+  },
+
+  "roundtrip_passed": true
+}
