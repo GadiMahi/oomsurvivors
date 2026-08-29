@@ -128,9 +128,16 @@ def build_datasets(cfg):
     cache_dir = cfg.get_path("cache.dir", "/kaggle/working/cache")
     bank = cfg.get_path("degrade.residual_bank", "artifacts/residual_bank.npz")
     if bank and not Path(bank).exists():
-        print(f"!! {bank} not found - falling back to Gaussian noise, which "
-              f"produces ~6x too few extreme outliers. Run "
-              f"scripts/build_residual_bank.py first.")
+        if not cfg.get_path("train.allow_gaussian_fallback", False):
+            raise FileNotFoundError(
+                f"{bank} not found.\n\n"
+                "70% of training samples are synthesised, so the noise generator "
+                "determines the quality of most of your training data. Gaussian "
+                "fallback produces ~6x too few extreme outliers and silently "
+                "trains on an easier problem than the test set.\n\n"
+                "Fix:  python scripts/build_residual_bank.py --set data.root=<DATA> --refit\n"
+                "Override (not recommended):  --set train.allow_gaussian_fallback=true")
+        print(f"!! {bank} not found - falling back to Gaussian noise (explicitly allowed).")
         bank = None
 
     dcfg = degrade_cfg_from_stats(width=cfg.get_path("degrade.width", 1.0),
