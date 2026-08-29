@@ -72,6 +72,11 @@ def main() -> int:
     ap.add_argument("input_dir", type=str, help="Directory containing degraded .npy images")
     ap.add_argument("output_dir", type=str, help="Directory to write restored .npy images")
     ap.add_argument("--batch_size", type=int, default=8, help="Inference batch size")
+    ap.add_argument("--weights", type=str, default=None,
+                    help="Checkpoint path. Defaults to weights/best_nafnet.pt, "
+                         "then artifacts/best_nafnet.pt")
+    ap.add_argument("--dim", type=int, default=None,
+                    help="Model width. Read from the checkpoint when omitted.")
     args = ap.parse_args()
 
     in_dir = Path(args.input_dir)
@@ -89,20 +94,37 @@ def main() -> int:
         print(f"No .npy files found in {in_dir}")
         return 2
 
-    model = build_model("nafnet", scale=SCALE).to(device).eval()
-
     # Determine which weights file to use
-    active_weights_path = WEIGHTS_PATH
-    if not active_weights_path.exists() and FALLBACK_WEIGHTS.exists():
-        active_weights_path = FALLBACK_WEIGHTS
+    if args.weights:
+        active_weights_path = Path(args.weights)
+    else:
+        active_weights_path = WEIGHTS_PATH
+        if not active_weights_path.exists() and FALLBACK_WEIGHTS.exists():
+            active_weights_path = FALLBACK_WEIGHTS
 
+    state_dict, dim = None, args.dim
     if active_weights_path.exists():
         sd = torch.load(active_weights_path, map_location=device)
-        state_dict = sd["model"] if isinstance(sd, dict) and "model" in sd and hasattr(sd["model"], "keys") else sd
+        state_dict = (sd["model"] if isinstance(sd, dict) and "model" in sd
+                      and hasattr(sd["model"], "keys") else sd)
+        if dim is None:
+            # Infer width from the checkpoint so a dim=96 model loads correctly
+            # without needing the flag. intro.weight is (dim, in_ch, 3, 3).
+            cfg_blob = sd.get("config") if isinstance(sd, dict) else None
+            if isinstance(cfg_blob, dict):
+                dim = (cfg_blob.get("model") or {}).get("dim")
+            if dim is None and "intro.weight" in state_dict:
+                dim = int(state_dict["intro.weight"].shape[0])
+    dim = dim or 64
+
+    model = build_model("nafnet", scale=SCALE, dim=dim).to(device).eval()
+
+    if state_dict is not None:
         model.load_state_dict(state_dict)
-        print(f"Loaded weights from: {active_weights_path}")
+        n_par = sum(p.numel() for p in model.parameters())
+        print(f"Loaded weights from: {active_weights_path}  (dim={dim}, {n_par/1e6:.2f}M params)")
     else:
-        print(f"WARNING: weights file not found at {WEIGHTS_PATH} or {FALLBACK_WEIGHTS}. Running with UNINITIALIZED weights!")
+        print(f"WARNING: no weights at {active_weights_path}. Running UNINITIALIZED!")
 
     # Load everything up front and group by shape so batches stay rectangular.
     t_start = time.perf_counter()
