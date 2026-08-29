@@ -22,21 +22,29 @@
   "frac_lr_above_1": 0.01838,
   "frac_lr_below_0": 0.00088,
 
-  "downsample_kernel": "randomised",
-  "kernels": ["area", "bicubic_aa", "lanczos", "bilinear_aa"],
-  "kernel_p": [0.3, 0.3, 0.2, 0.2],
-  "kernel_scores": {
-    "area": 1.8016e-04,
-    "bicubic_aa": 1.8189e-04,
-    "lanczos": 1.8196e-04,
-    "bilinear_aa": 1.8296e-04,
-    "nearest": 2.7286e-04
+  "downsample_kernel": "gauss:0.6",
+  "kernels": ["gauss:0.5", "gauss:0.6", "gauss:0.7"],
+  "kernel_p": [0.25, 0.50, 0.25],
+  "kernel_identification": {
+    "method": "spectral distance + lag-1 autocorrelation + local variance",
+    "note": "Round-1 low-pass MSE was insensitive by construction - it discards the band where kernels differ, which is why it wrongly reported 'unidentifiable'. Two independent statistics converge on sigma ~0.55-0.60.",
+    "sweep": {
+      "decimate":  {"ac_diff": -0.0864, "lv_ratio": 1.159, "score": 0.6091},
+      "gauss:0.4": {"ac_diff": -0.0594, "lv_ratio": 1.116, "score": 0.4448},
+      "gauss:0.5": {"ac_diff": -0.0182, "lv_ratio": 1.045, "score": 0.3749},
+      "gauss:0.6": {"ac_diff":  0.0113, "lv_ratio": 1.004, "score": 0.2400},
+      "gauss:0.7": {"ac_diff":  0.0278, "lv_ratio": 0.971, "score": 0.2799},
+      "area":      {"ac_diff":  0.0500, "lv_ratio": 0.947, "score": 0.3334}
+    },
+    "residual_spectral_mismatch": 0.224,
+    "residual_note": "spec.dist stays ~0.22 across every kernel, so the remaining high-frequency gap is NOT kernel-related. Most likely cause is per-pixel-independent noise sampling missing real spatial structure. Revisit only if training underperforms.",
+    "removed": "bicubic_aa and lanczos destabilised the variance fit (local-variance ratios of 5.4 and 3864) and were the main source of the original synthetic/real mismatch."
   },
-  "kernel_spread_pct": 1.55,
 
   "order_mix": [0.1, 0.9],
   "noise_autocorr_lag1": [-0.0500, -0.0516],
 
+  "_noise_fit_note": "Fitted against the OLD 'area' kernel. Re-run scripts/build_residual_bank.py --refit to refit against gauss:0.6 before training.",
   "noise_var_fit": {
     "a_mult": 2.5071e-02,
     "b_poisson": 9.5974e-03,
