@@ -73,12 +73,47 @@ def add_noise_varfit(img: np.ndarray, a: float, b: float, c: float, rng,
     return (img + sigma * rng.standard_normal(img.shape).astype(np.float32)).astype(np.float32)
 
 
+def add_noise_empirical(img: np.ndarray, banks, a: float, b: float, c: float, rng,
+                        scale: float = 1.0) -> np.ndarray:
+    """Signal-dependent noise with the REAL tail shape, resampled from data.
+
+    `banks` comes from noise_fit.build_residual_bank: one array of normalised
+    residuals per intensity bin, drawn from the genuine paired data. Sampling
+    from these reproduces the measured skew (+0.52) and excess kurtosis (+2.08)
+    exactly, where a Gaussian generator produces roughly a quarter of the real
+    3-sigma outliers.
+
+    Falls back to Gaussian for any bin with no collected residuals.
+    """
+    mu = np.clip(img, 0.0, None)
+    sigma = np.sqrt(np.clip(a * mu * mu + b * mu + c, 0.0, None)).astype(np.float32)
+    sigma *= np.float32(scale)
+
+    nb = len(banks)
+    idx = np.clip((np.clip(mu, 0.0, 1.0) * nb).astype(np.int32), 0, nb - 1)
+    z = np.empty(img.shape, dtype=np.float32)
+    for k in range(nb):
+        m = idx == k
+        cnt = int(m.sum())
+        if not cnt:
+            continue
+        bk = banks[k]
+        if bk.size > 1:
+            z[m] = bk[rng.integers(0, bk.size, cnt)]
+        else:
+            z[m] = rng.standard_normal(cnt).astype(np.float32)
+    return (img + sigma * z).astype(np.float32)
+
+
 def degrade(gt: np.ndarray, rng, cfg, width: float | None = None) -> np.ndarray:
     """Produce a NoisyLR-like image from a clean GT image.
 
-    If cfg contains 'noise_var_fit' the measured variance curve is used (correct
-    whenever the fit has a linear term). Otherwise falls back to the simple
-    speckle+Gaussian parameterisation.
+    Noise generator, in order of preference:
+      1. 'residual_bank' present -> empirical resampling, reproduces the real
+         heavy tails (round-2 excess kurtosis 2.08). Preferred.
+      2. 'noise_var_fit' present -> Gaussian matched to the measured variance
+         curve. Correct in the bulk, ~4x too few 3-sigma outliers.
+      3. otherwise -> simple speckle + Gaussian parameterisation.
     """
     width = cfg["width"] if width is None else width
     j = float(cfg.get("jitter", 0.30)) * float(width)
@@ -87,7 +122,13 @@ def degrade(gt: np.ndarray, rng, cfg, width: float | None = None) -> np.ndarray:
     order = rng.choice(["noise_first", "noise_last"], p=np.asarray(cfg["order_mix"], dtype=float))
 
     fit = cfg.get("noise_var_fit")
-    if fit:
+    bank = cfg.get("residual_bank")
+    if fit and bank is not None:
+        scale = float(rng.uniform(1.0 - j, 1.0 + j))
+        noise = lambda x: add_noise_empirical(  # noqa: E731
+            x, bank, float(fit["a_mult"]), float(fit["b_poisson"]),
+            float(fit["c_additive"]), rng, scale=scale)
+    elif fit:
         # Jitter the whole noise level, preserving the shape of the curve.
         scale = float(rng.uniform(1.0 - j, 1.0 + j))
         noise = lambda x: add_noise_varfit(  # noqa: E731

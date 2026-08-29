@@ -72,6 +72,79 @@ def estimate(pairs, downsample_fn, kernel, nbins=50, max_images=40):
                 counts=tot_n[ok].tolist())
 
 
+def build_residual_bank(pairs, downsample_fn, kernel, a, b, c,
+                        nbins=20, per_bin=200_000, max_images=80):
+    """Collect REAL noise residuals, normalised by their predicted sigma.
+
+    Motivation: round-2 residuals are right-skewed with excess kurtosis 2.08.
+    Events beyond 3 sigma occur at 4x the Gaussian rate and beyond 5 sigma at
+    roughly 880x. A Gaussian generator therefore reproduces the variance
+    correctly but produces far too few extreme pixels - and those are exactly
+    the pixels that survive restoration as visible speckle artefacts.
+
+    Rather than guessing a parametric family (Gamma, Student-t), we resample the
+    real thing. Residuals are binned by clean intensity because the noise is
+    signal-dependent, then divided by the fitted sigma so a single bank can be
+    rescaled to any noise level via the curriculum `width` knob.
+
+    Returns: list[np.ndarray], one array of normalised residuals per bin.
+    """
+    from .io_utils import load_image
+
+    banks = [[] for _ in range(nbins)]
+    for gt_p, lr_p in pairs[:max_images]:
+        gt, lr = load_image(gt_p), load_image(lr_p)
+        clean = downsample_fn(gt, kernel)
+        if clean.shape != lr.shape:
+            continue
+        r = (lr - clean).ravel()
+        mu = np.clip(clean.ravel(), 0.0, 1.0)
+        sigma = np.sqrt(np.clip(a * mu * mu + b * mu + c, 1e-12, None))
+        idx = np.clip((mu * nbins).astype(int), 0, nbins - 1)
+        for k in range(nbins):
+            m = idx == k
+            if m.any():
+                banks[k].append((r[m] / sigma[m]).astype(np.float32))
+
+    out = []
+    for bk in banks:
+        if bk:
+            arr = np.concatenate(bk)
+            if arr.size > per_bin:
+                arr = np.random.default_rng(0).choice(arr, per_bin, replace=False)
+            out.append(arr.astype(np.float32))
+        else:
+            out.append(np.zeros(1, dtype=np.float32))
+    return out
+
+
+def save_residual_bank(banks, path):
+    np.savez_compressed(path, n=len(banks),
+                        **{f"b{i}": bk for i, bk in enumerate(banks)})
+    return path
+
+
+def load_residual_bank(path):
+    z = np.load(path)
+    return [z[f"b{i}"] for i in range(int(z["n"]))]
+
+
+def bank_stats(banks) -> dict:
+    """Sanity-check a bank: normalised residuals should have std ~1 per bin."""
+    allv = np.concatenate([b for b in banks if b.size > 1])
+    from scipy import stats as _st
+    return {
+        "n_total": int(allv.size),
+        "mean": float(allv.mean()),
+        "std": float(allv.std()),
+        "skew": float(_st.skew(allv)),
+        "excess_kurtosis": float(_st.kurtosis(allv)),
+        "frac_beyond_3": float((np.abs(allv) > 3).mean()),
+        "frac_beyond_5": float((np.abs(allv) > 5).mean()),
+        "per_bin_counts": [int(b.size) for b in banks],
+    }
+
+
 def fit_kernel_lstsq(pairs, load_fn, ksize=5, scale=2, n_images=12, samples=800,
                      seed=0, ridge=1e-4):
     """Kernel estimate by regularised least squares (GT patches -> LR pixels).

@@ -3,13 +3,16 @@
 # Override any value from the CLI:  --set data.root=/kaggle/input/kla-data
 
 data:
-  # Kaggle:  /kaggle/input/<dataset-slug>
-  # Local:   ./data
-  root: /kaggle/input/kla-dataset
+  # Round 2: /kaggle/input/<slug>/semicon_train_data
+  # Round 1: /kaggle/input/kla-dataset
+  root: /kaggle/input/semicon-round2/semicon_train_data
   gt_subdir: GT
   lr_subdir: NoisyLR
   # Leave null to auto-detect from the files themselves.
   file_glob: null
+  # Round 2 ships 4,785 GT against 1,325 pairs. The mismatch is INTENTIONAL:
+  # the unpaired clean images are meant to be degraded synthetically.
+  expect_unequal_counts: true
 
 io:
   # All auto-detected by scripts/run_inventory.py, then frozen here.
@@ -26,18 +29,27 @@ cache:
 dataset:
   lr_patch: 64             # HR patch = lr_patch * scale
   scale: 2
-  grad_percentile: 40      # rejection-sampling threshold
+  grad_percentile: 40      # measured on the CLEAN GT patch, not the noisy LR
+  grad_thresh: 0.1222      # round-2 GT p40; null => measure at runtime
   crop_tries: 8
+  use_gt_only: true        # include the 3,460 unpaired clean images
+  real_frac: 0.30          # share of REAL pairs per epoch; null => natural 28%
+  synth_p: 0.0             # extra chance a PAIRED item is synthesised instead
 
 degrade:
   width: 1.0               # curriculum knob, ramp 0.3 -> 1.0
-  # Filled in by notebooks/02_degradation.ipynb
-  kernels: [bicubic_aa, bilinear_aa, area, lanczos]
-  kernel_p: [0.55, 0.15, 0.15, 0.15]
-  order_mix: [0.5, 0.5]    # [noise_first, noise_last]
-  meas_mult: 0.10
-  meas_add: 0.02
+  # Measured on 1,325 round-2 pairs. See docs/ROUND2_EDA.md and artifacts/stats.json.
+  kernels: [area, bicubic_aa, lanczos, bilinear_aa]
+  kernel_p: [0.3, 0.3, 0.2, 0.2]     # spread across candidates is 1.55% -> not
+                                     # identifiable above the noise floor
+  order_mix: [0.1, 0.9]    # [noise_first, noise_last]; autocorr ~0 => noise last
+  meas_mult: 0.1583        # round 1 was 0.1431
+  meas_add: 0.0
   jitter: 0.30             # +/- fraction. KLA: levels vary "within a similar range"
+  # Empirical residual resampling. Round-2 noise is right-skewed (+0.55) with
+  # excess kurtosis ~1.4; a Gaussian generator gives ~6x too few 5-sigma
+  # outliers. Build with scripts/build_residual_bank.py.
+  residual_bank: artifacts/residual_bank.npz
 
 augment:
   scale_jitter: [0.7, 1.4]
@@ -45,12 +57,24 @@ augment:
   cutblur_p: 0.7
 
 split:
+  # Split ONLY the real pairs. Unpaired GT all goes to training - it cannot be
+  # validated against, having no real degraded counterpart.
   n_clusters: 6
   ood_cluster: null      # null => auto-pick the largest cluster under max_ood_frac
   val_frac: 0.1
   max_ood_frac: 0.25     # OOD cluster must be big enough to be a reliable metric
-  min_ood_n: 150
+  min_ood_n: 80          # round-2 cluster sizes: 47/183/88/127/71/84 (per 600)
   seed: 1337
+
+# Reference numbers for round-2 comparisons. Round-1 scores are NOT comparable:
+# that dataset was natural photographs and roughly 2.2 dB easier.
+baseline:
+  bicubic:
+    psnr: 20.4706
+    ssim: 0.5079
+    ssim_edge: 0.5964
+    ssim_flat: 0.4784
+    lpips: 0.4839
 
 train:
   seed: 1337

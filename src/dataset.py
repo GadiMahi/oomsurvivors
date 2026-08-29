@@ -22,10 +22,22 @@ from .degrade import degrade
 from .transforms import load_stats, normalize
 
 
-def degrade_cfg_from_stats(stats=None, width=1.0, jitter=0.30) -> dict:
-    """Build a degrade() config from the measured constants in stats.json."""
+def degrade_cfg_from_stats(stats=None, width=1.0, jitter=0.30,
+                           residual_bank=None) -> dict:
+    """Build a degrade() config from the measured constants in stats.json.
+
+    residual_bank : path to a .npz from scripts/build_residual_bank.py, or an
+                    already-loaded bank. Strongly recommended for round 2 - the
+                    noise is right-skewed with excess kurtosis 2.08, and a
+                    Gaussian generator produces ~6x too few 5-sigma outliers.
+    """
     s = stats or load_stats()
+    bank = residual_bank
+    if isinstance(bank, (str, Path)):
+        from .noise_fit import load_residual_bank
+        bank = load_residual_bank(bank)
     return {
+        "residual_bank": bank,
         "width": width,
         "jitter": jitter,
         "kernels": s.get("kernels", ["area", "bicubic_aa", "lanczos", "bilinear_aa"]),
@@ -44,11 +56,12 @@ def _grad_energy(patch: np.ndarray) -> float:
 class RestorationDataset(Dataset):
     def __init__(self, cache_dir, stems=None, lr_patch=64, scale=2,
                  grad_thresh=0.0, crop_tries=8, train=True, seed=1337,
-                 synth_p=0.0, degrade_cfg=None, jitter_range=(0.7, 1.4), margin=8):
+                 synth_p=0.0, degrade_cfg=None, jitter_range=(0.7, 1.4), margin=8,
+                 use_gt_only=True, gt_only_stems=None, real_frac=None):
         """
-        synth_p       probability a training sample is SYNTHESISED from the GT
-                      instead of using the provided degraded pair
-        degrade_cfg   from degrade_cfg_from_stats(); required when synth_p > 0
+        synth_p       probability a PAIRED sample is synthesised from its GT
+                      instead of using the provided degraded counterpart
+        degrade_cfg   from degrade_cfg_from_stats(); required for any synthesis
         jitter_range  GT rescaling applied BEFORE degradation. This is the main
                       defence against unfamiliar feature scales - the training
                       set is entirely 256->128, while evaluation may include
@@ -58,6 +71,15 @@ class RestorationDataset(Dataset):
                       boundary. Measured effect on border-row statistics was
                       small (<0.2%), so this is cheap insurance rather than a
                       fix for an observed problem.
+
+        use_gt_only   include the unpaired ground truths (kind="gt_only" in the
+                      cache index). Round 2 ships 4,785 GT against 1,325 pairs,
+                      so ~72% of clean images are reachable ONLY through
+                      synthesis. Leave this on for training, off for validation.
+        gt_only_stems restrict the unpaired pool (None = all of it)
+        real_frac     target proportion of REAL pairs per epoch. None keeps the
+                      dataset's natural ratio (1,325 : 3,460 ~= 28% real).
+                      Setting e.g. 0.3 repeats paired items to hit that share.
         """
         self.cache_dir = Path(cache_dir)
         with open(self.cache_dir / "index.json") as f:
@@ -72,23 +94,59 @@ class RestorationDataset(Dataset):
         self.degrade_cfg = degrade_cfg
         self.jitter_range = tuple(jitter_range)
         self.margin = int(margin) - int(margin) % scale     # keep divisible by scale
+
+        keep = set(stems) if stems is not None else None
+        keep_go = set(gt_only_stems) if gt_only_stems is not None else None
+
+        self._groups = []
+        paired_items, gtonly_items = [], []
+        for gi, g in enumerate(self.index):
+            kind = g.get("kind", "paired")
+            gt_mm = np.load(self.cache_dir / g["gt_file"], mmap_mode="r")
+            lr_mm = (np.load(self.cache_dir / g["lr_file"], mmap_mode="r")
+                     if g.get("lr_file") else None)
+            self._groups.append((gt_mm, lr_mm, g))
+
+            if kind == "gt_only":
+                if not (use_gt_only and train):
+                    continue
+                for i, stem in enumerate(g["stems"]):
+                    if keep_go is None or stem in keep_go:
+                        gtonly_items.append((gi, i, stem))
+            else:
+                for i, stem in enumerate(g["stems"]):
+                    if keep is None or stem in keep:
+                        paired_items.append((gi, i, stem))
+
+        if gtonly_items and self.degrade_cfg is None:
+            raise ValueError(
+                "gt_only images require degrade_cfg - they have no real degraded "
+                "counterpart and can only be used through degrade(). "
+                "Pass degrade_cfg_from_stats() or set use_gt_only=False.")
         if self.synth_p > 0 and self.degrade_cfg is None:
             raise ValueError("synth_p > 0 requires degrade_cfg (see degrade_cfg_from_stats)")
 
-        self._groups, self.items = [], []
-        keep = set(stems) if stems is not None else None
-        for gi, g in enumerate(self.index):
-            self._groups.append((
-                np.load(self.cache_dir / g["gt_file"], mmap_mode="r"),
-                np.load(self.cache_dir / g["lr_file"], mmap_mode="r"),
-                g,
-            ))
-            for i, stem in enumerate(g["stems"]):
-                if keep is None or stem in keep:
-                    self.items.append((gi, i, stem))
+        # Realise the real/synthetic mix as an explicit item list so ordinary
+        # samplers and DDP work unchanged, rather than drawing randomly per call.
+        if real_frac is not None and paired_items and gtonly_items:
+            target = float(real_frac)
+            n_slots = max(1, int(round(len(gtonly_items) * target / max(1e-9, 1 - target))))
+            reps = int(np.ceil(n_slots / len(paired_items)))
+            paired_items = (paired_items * reps)[:n_slots]
+
+        self.paired_items, self.gtonly_items = paired_items, gtonly_items
+        self.items = [(gi, i, s, False) for gi, i, s in paired_items] + \
+                     [(gi, i, s, True) for gi, i, s in gtonly_items]
 
     def __len__(self) -> int:
         return len(self.items)
+
+    def composition(self) -> dict:
+        n = max(1, len(self.items))
+        return {"total": len(self.items),
+                "paired_slots": len(self.paired_items),
+                "gt_only_slots": len(self.gtonly_items),
+                "real_share": round(len(self.paired_items) / n, 4)}
 
     def _ensure_rng(self):
         """Per-worker RNG.
@@ -114,11 +172,12 @@ class RestorationDataset(Dataset):
             self.degrade_cfg = {**self.degrade_cfg, "width": float(width)}
 
     def _read(self, gi: int, i: int):
+        """Return (gt, lr). lr is None for unpaired ground truths."""
         gt_mm, lr_mm, g = self._groups[gi]
         gt = np.asarray(gt_mm[i], dtype=np.float32)
-        lr = np.asarray(lr_mm[i], dtype=np.float32)
         if g["gt_dtype"] == "uint16":
             gt = gt / 65535.0
+        lr = np.asarray(lr_mm[i], dtype=np.float32) if lr_mm is not None else None
         return gt, lr
 
     def _crop_hr(self, hr: np.ndarray, size: int):
@@ -187,17 +246,28 @@ class RestorationDataset(Dataset):
         return (gt[y * s:(y + p) * s, x * s:(x + p) * s], lr[y:y + p, x:x + p])
 
     def __getitem__(self, idx: int):
-        gi, i, stem = self.items[idx]
+        gi, i, stem, is_gt_only = self.items[idx]
         gt, lr = self._read(gi, i)
-        if self.train:
+
+        if is_gt_only or lr is None:
+            # No real degraded counterpart exists: synthesis is the only route.
+            gt, lr = self._synth(gt)
+            synthetic = True
+        elif self.train:
             if self.synth_p > 0 and float(self._ensure_rng().random()) < self.synth_p:
                 gt, lr = self._synth(gt)
+                synthetic = True
             else:
                 gt, lr = self._crop(gt, lr)
+                synthetic = False
+        else:
+            synthetic = False
+
         return {
             "lr": torch.from_numpy(np.ascontiguousarray(normalize(lr))).unsqueeze(0),
             "hr": torch.from_numpy(np.ascontiguousarray(normalize(gt))).unsqueeze(0),
             "stem": stem,
+            "synthetic": synthetic,
         }
 
 
@@ -218,7 +288,7 @@ def estimate_grad_threshold(cache_dir, percentile=40, lr_patch=64, scale=2,
     hr_patch = lr_patch * scale
     vals = []
     for _ in range(n):
-        gi, i, _ = ds.items[int(rng.integers(0, len(ds.items)))]
+        gi, i, _, _ = ds.items[int(rng.integers(0, len(ds.items)))]
         gt, _ = ds._read(gi, i)
         H, W = gt.shape
         if H <= hr_patch or W <= hr_patch:

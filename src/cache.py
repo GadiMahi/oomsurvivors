@@ -24,8 +24,17 @@ def _store(arr: np.ndarray, dtype: str) -> np.ndarray:
     return arr.astype(dtype, copy=False)
 
 
-def build_cache(pairs, out_dir, gt_dtype="float32", lr_dtype="float32"):
-    """pairs: list[(gt_path, lr_path)]. Groups by (gt_shape, lr_shape)."""
+def build_cache(pairs, out_dir, gt_dtype="float32", lr_dtype="float32",
+                gt_only=None, append=False):
+    """Cache paired data, and optionally a pool of unpaired ground truths.
+
+    pairs    : list[(gt_path, lr_path)] - real degraded/clean pairs
+    gt_only  : list[gt_path] - clean images with NO paired degraded counterpart.
+               Round 2 ships 4,785 GT against only 1,325 pairs, so ~72% of the
+               clean images can only enter training through degrade(). These are
+               cached separately and marked kind="gt_only" in index.json.
+    append   : merge into an existing index.json rather than overwriting it.
+    """
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -54,6 +63,7 @@ def build_cache(pairs, out_dir, gt_dtype="float32", lr_dtype="float32"):
             lr_mm[i] = _store(load_image(lr_p), lr_dtype)  # LR may exceed [0,1]
         gt_mm.flush(); lr_mm.flush()
         index.append({
+            "kind": "paired",
             "tag": tag, "n": len(items),
             "gt_file": f"gt_{tag}.npy", "lr_file": f"lr_{tag}.npy",
             "gt_shape": list(gshape), "lr_shape": list(lshape),
@@ -61,6 +71,36 @@ def build_cache(pairs, out_dir, gt_dtype="float32", lr_dtype="float32"):
             "stems": [Path(p).stem for p, _ in items],
         })
 
-    with open(out_dir / "index.json", "w") as f:
+    # --- unpaired ground truths -------------------------------------------
+    if gt_only:
+        gt_groups: dict[tuple, list] = {}
+        for gt_p in tqdm(gt_only, desc="scan gt-only shapes"):
+            gt_groups.setdefault(load_image(gt_p).shape, []).append(gt_p)
+
+        for gshape, items in gt_groups.items():
+            tag = f"gtonly_{gshape[0]}x{gshape[1]}"
+            mm = np.lib.format.open_memmap(
+                out_dir / f"{tag}.npy", mode="w+",
+                dtype=gt_dtype, shape=(len(items), *gshape))
+            for i, gt_p in enumerate(tqdm(items, desc=f"cache {tag}")):
+                mm[i] = _store(load_image(gt_p), gt_dtype)
+            mm.flush()
+            index.append({
+                "kind": "gt_only",
+                "tag": tag, "n": len(items),
+                "gt_file": f"{tag}.npy", "lr_file": None,
+                "gt_shape": list(gshape), "lr_shape": None,
+                "gt_dtype": gt_dtype, "lr_dtype": None,
+                "stems": [Path(p).stem for p in items],
+            })
+
+    idx_path = out_dir / "index.json"
+    if append and idx_path.exists():
+        with open(idx_path) as f:
+            existing = json.load(f)
+        have = {e["tag"] for e in index}
+        index = [e for e in existing if e["tag"] not in have] + index
+
+    with open(idx_path, "w") as f:
         json.dump(index, f, indent=2)
     return index
