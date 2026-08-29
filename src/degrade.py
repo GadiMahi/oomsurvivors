@@ -60,7 +60,26 @@ _NOAA = {
 }
 
 
+def _gauss_decimate(img: np.ndarray, scale: int, sigma: float) -> np.ndarray:
+    """Blur by `sigma`, then decimate. Tunable antialiasing strength.
+
+    sigma = 0     -> pure decimation, maximum aliasing (measured too SHARP:
+                     autocorr -0.086 vs real, local variance ratio 1.16)
+    sigma ~ 0.8+  -> approaches box/area averaging (measured too SMOOTH:
+                     autocorr +0.050, local variance ratio 0.95)
+
+    Real round-2 data sits between those two, i.e. KLA used partial
+    antialiasing. Sweeping sigma finds where.
+    """
+    from scipy.ndimage import gaussian_filter
+    if sigma > 0:
+        img = gaussian_filter(img.astype(np.float32), sigma, mode="reflect")
+    return _decimate(img, scale)
+
+
 def downsample(img: np.ndarray, kernel: str, scale: int = 2) -> np.ndarray:
+    if isinstance(kernel, str) and kernel.startswith("gauss:"):
+        return _gauss_decimate(img, scale, float(kernel.split(":", 1)[1]))
     if kernel in _NOAA:
         return _NOAA[kernel](img, scale)
     h, w = img.shape[-2:]
