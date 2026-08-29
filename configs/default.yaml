@@ -50,11 +50,14 @@ degrade:
   # excess kurtosis ~1.4; a Gaussian generator gives ~6x too few 5-sigma
   # outliers. Build with scripts/build_residual_bank.py.
   residual_bank: artifacts/residual_bank.npz
+  curriculum: [0.3, 1.0]   # degradation-variety ramp from first to last epoch
 
 augment:
-  scale_jitter: [0.7, 1.4]
-  d4: true
-  cutblur_p: 0.7
+  scale_jitter: [0.7, 1.4]   # applied to GT BEFORE degrading; only defence
+                             # against 512x512 evaluation content
+  d4: true                   # free; SEM texture has no preferred orientation
+  cutblur_p: 0.5             # replaces a patch of the noisy input with a clean
+                             # downsample, so the model learns WHERE to restore
 
 split:
   # Split ONLY the real pairs. Unpaired GT all goes to training - it cannot be
@@ -79,7 +82,22 @@ baseline:
 train:
   seed: 1337
   batch_size: 32
+  val_batch_size: 8
   num_workers: 4        # Kaggle CPU allowance; 8 triggers a warning
+  epochs: 80            # round-1 runs plateaued around epoch 50-60
+  lr: 5.0e-4
+  weight_decay: 1.0e-4
+  amp: true             # T4 has tensor cores; roughly 2x throughput
+  grad_clip: 1.0
+  lpips_net: vgg        # round-1: vgg-trained model beat the alex-trained one
+  select_metric: ssim   # checkpoint on OOD ssim; all metrics are logged
+  output_dir: artifacts
+
+loss:
+  charbonnier: 1.0
+  lpips: 0.05           # too high and it fights pixel fidelity
+  edge: 0.5
+  edge_weight_alpha: 4.0   # per-pixel Charbonnier weighting toward structure
 
 inference:
   batch_size: 8

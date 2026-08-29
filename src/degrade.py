@@ -30,13 +30,65 @@ _PIL_FILTERS = {
 }
 
 
+def _decimate(img: np.ndarray, scale: int) -> np.ndarray:
+    """Pure subsampling. Maximum aliasing - keeps all high-frequency energy."""
+    return np.ascontiguousarray(img[::scale, ::scale], dtype=np.float32)
+
+
+def _zoom(img: np.ndarray, scale: int, order: int) -> np.ndarray:
+    """scipy interpolation WITHOUT a prefilter low-pass, so aliasing survives.
+
+    This is what torch.interpolate(antialias=False) and cv2.resize do, and both
+    are common defaults. PIL, by contrast, always antialiases on downscale.
+    """
+    from scipy.ndimage import zoom as _z
+    h, w = img.shape[-2:]
+    out = _z(img.astype(np.float32), 1.0 / scale, order=order, mode="reflect",
+             grid_mode=True, prefilter=False)
+    return np.ascontiguousarray(out[: h // scale, : w // scale], dtype=np.float32)
+
+
+# Non-antialiased variants. Their presence matters: an antialiased downsample
+# removes high-frequency content that a non-antialiased one folds back into the
+# image as aliasing, and that difference is invisible to a low-pass comparison
+# but dominates the high end of the power spectrum.
+_NOAA = {
+    "decimate": lambda im, s: _decimate(im, s),
+    "cubic_noaa": lambda im, s: _zoom(im, s, 3),
+    "linear_noaa": lambda im, s: _zoom(im, s, 1),
+    "nearest_noaa": lambda im, s: _zoom(im, s, 0),
+}
+
+
 def downsample(img: np.ndarray, kernel: str, scale: int = 2) -> np.ndarray:
+    if kernel in _NOAA:
+        return _NOAA[kernel](img, scale)
     h, w = img.shape[-2:]
     size = (max(1, w // scale), max(1, h // scale))  # PIL wants (W, H)
     if kernel not in _PIL_FILTERS:
-        raise ValueError(f"Unknown kernel {kernel!r}")
+        raise ValueError(f"Unknown kernel {kernel!r}. Known: "
+                         f"{sorted(set(_PIL_FILTERS) | set(_NOAA))}")
     out = Image.fromarray(img.astype(np.float32), mode="F").resize(size, _PIL_FILTERS[kernel])
     return np.asarray(out, dtype=np.float32)
+
+
+def spectral_distance(a: np.ndarray, b: np.ndarray, hi_from: float = 0.5) -> float:
+    """Relative power-spectrum mismatch in the HIGH-frequency band.
+
+    Low-pass MSE deliberately discards exactly the band where antialiased and
+    non-antialiased kernels differ, so it cannot tell them apart. This can.
+    """
+    def radial(x, nb=32):
+        F = np.fft.fftshift(np.abs(np.fft.fft2(x - x.mean())))
+        h, w = F.shape
+        yy, xx = np.mgrid[:h, :w]
+        r = np.hypot(yy - h / 2, xx - w / 2)
+        r = (r / r.max() * (nb - 1)).astype(int)
+        return np.array([F[r == k].mean() for k in range(nb)])
+
+    ra, rb = radial(a), radial(b)
+    k0 = int(len(ra) * hi_from)
+    return float(np.mean(np.abs(rb[k0:] / np.maximum(ra[k0:], 1e-12) - 1.0)))
 
 
 def add_noise(img: np.ndarray, sigma_mult: float, sigma_add: float, rng) -> np.ndarray:
