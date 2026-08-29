@@ -44,14 +44,40 @@
   "order_mix": [0.1, 0.9],
   "noise_autocorr_lag1": [-0.0500, -0.0516],
 
-  "_noise_fit_note": "Fitted against the OLD 'area' kernel. Re-run scripts/build_residual_bank.py --refit to refit against gauss:0.6 before training.",
+  "_noise_fit_note": "Fitted against the identified kernel gauss:0.6 over 200 image pairs. The additive term is non-zero here but pinned to exactly 0 when fitted against the wrong ('area') kernel - independent evidence the kernel identification is correct, since the KLA spec states additive Gaussian noise is present.",
   "noise_var_fit": {
+    "a_mult": 0.01334319090552458,
+    "b_poisson": 0.021085418144698703,
+    "c_additive": 0.000323866518105635
+  },
+  "meas_mult": 0.11551273049116526,
+  "meas_add": 0.017996291787633224,
+  "noise_var_fit_previous_area_kernel": {
     "a_mult": 2.5071e-02,
     "b_poisson": 9.5974e-03,
-    "c_additive": 0.0
+    "c_additive": 0.0,
+    "note": "Superseded. Kept for the record - shows how sensitive the variance decomposition is to the clean reference."
   },
-  "meas_mult": 0.1583,
-  "meas_add": 0.0,
+  "residual_bank": {
+    "n_residuals": 2362301,
+    "std": 1.0008,
+    "skew": 0.6640,
+    "excess_kurtosis": 2.1305,
+    "frac_beyond_3sigma": 0.008709,
+    "frac_beyond_5sigma": 0.000744,
+    "note": "Kurtosis 2.13 matches the 2.08 measured on raw residuals in the original EDA. Fitting against the wrong kernel had washed this out to 0.81."
+  },
+  "synthetic_vs_real_validation": {
+    "autocorr_lag1_diff": 0.0124,
+    "local_variance_ratio": 1.001,
+    "std_real": 0.1591,
+    "std_synth": 0.1585,
+    "frac_above1_real": 0.0102,
+    "frac_above1_synth": 0.0093,
+    "spectral_distance": 0.3258,
+    "before_kernel_fix": {"autocorr_lag1_diff": 0.1003, "local_variance_ratio": 0.863},
+    "note": "spectral_distance never discriminated between kernels (0.22-0.42 with no trend) and likely reflects the highest-frequency bins where absolute power is negligible. Revisit only if training underperforms."
+  },
   "residual_std": 0.10810,
   "residual_skew": 0.5152,
   "residual_excess_kurtosis": 2.0798,
