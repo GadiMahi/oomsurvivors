@@ -13,7 +13,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from src.config import add_config_args, load_config   # noqa: E402
-from src.io_utils import load_image, pair_by_stem     # noqa: E402
+from src.io_utils import list_images, load_image, pair_by_stem  # noqa: E402
 from src.splits import make_splits, save_splits, structure_features  # noqa: E402
 
 
@@ -23,11 +23,25 @@ def main() -> int:
     cfg = load_config(args.config, args.overrides)
 
     root = Path(cfg.get_path("data.root"))
-    pairs = pair_by_stem(root / cfg.get_path("data.gt_subdir"),
-                         root / cfg.get_path("data.lr_subdir"))
-    stems = [g.stem for g, _ in pairs]
+    gt_dir = root / cfg.get_path("data.gt_subdir")
+    lr_dir = root / cfg.get_path("data.lr_subdir")
 
-    print(f"featurising {len(pairs)} images ...")
+    pairs = pair_by_stem(gt_dir, lr_dir)
+    stems = [g.stem for g, _ in pairs]
+    paired = set(stems)
+
+    # Unpaired clean images go to training wholesale. They cannot be validated
+    # against - no real degraded counterpart exists, so scoring on them would
+    # only measure how well the model inverts our own synthetic degradation.
+    gt_only = sorted(p.stem for p in list_images(gt_dir) if p.stem not in paired)
+
+    print(f"paired images : {len(pairs)}")
+    print(f"unpaired GT   : {len(gt_only)}  -> training only, via degrade()")
+    if not pairs:
+        print("!! no paired images found; check data.root / subdir names")
+        return 2
+
+    print(f"\nfeaturising {len(pairs)} paired images ...")
     feats = structure_features(load_image(g) for g, _ in pairs)
 
     sp = make_splits(stems, feats,
@@ -36,14 +50,20 @@ def main() -> int:
                      val_frac=cfg.get_path("split.val_frac"),
                      seed=cfg.get_path("split.seed"),
                      max_ood_frac=cfg.get_path("split.max_ood_frac", 0.25),
-                     min_ood_n=cfg.get_path("split.min_ood_n", 150))
+                     min_ood_n=cfg.get_path("split.min_ood_n", 150),
+                     gt_only_stems=gt_only)
     save_splits(sp)
 
-    print("held-out OOD cluster:", sp["ood_cluster"])
-    print("cluster sizes:", dict(sorted(Counter(sp["clusters"].values()).items())))
-    print(f"train={len(sp['train'])}  val_id={len(sp['val_id'])}  val_ood={len(sp['val_ood'])}")
+    c = sp["counts"]
+    print(f"\nheld-out OOD cluster: {sp['ood_cluster']}")
+    print(f"cluster sizes: {sp['cluster_sizes']}")
+    print(f"\n  train (real pairs)  : {c['train_paired']}")
+    print(f"  train (gt-only)     : {c['train_gt_only']}")
+    print(f"  val_id  (real)      : {c['val_id']}")
+    print(f"  val_ood (real)      : {c['val_ood']}   <- PRIMARY metric")
+    print(f"  real share of train : {c['real_share_of_train']*100:.1f}%")
     print("\nEyeball a few images per cluster before trusting this split.")
-    print("val_ood is the PRIMARY metric; val_id is a sanity check.")
+    print("Validation uses REAL pairs only - never synthetic.")
     return 0
 
 

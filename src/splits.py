@@ -50,7 +50,19 @@ def choose_ood_cluster(labels, max_frac=0.25, min_n=150) -> int:
 
 
 def make_splits(stems, features, n_clusters=6, ood_cluster=None, val_frac=0.1, seed=1337,
-                max_ood_frac=0.25, min_ood_n=150) -> dict:
+                max_ood_frac=0.25, min_ood_n=150, gt_only_stems=None) -> dict:
+    """Cluster-based split over the REAL PAIRS only.
+
+    `stems` must be the paired images. Unpaired ground truths (`gt_only_stems`)
+    are appended to the training pool unconditionally and are never clustered or
+    validated against: they have no real degraded counterpart, so any "metric"
+    computed on them would only measure how well the model inverts our own
+    synthetic degradation, which is circular.
+
+    Round-2 shape: 1,325 paired (split three ways) + 3,460 unpaired (all train).
+    """
+    import collections
+
     from sklearn.cluster import KMeans
     from sklearn.preprocessing import StandardScaler
 
@@ -66,17 +78,33 @@ def make_splits(stems, features, n_clusters=6, ood_cluster=None, val_frac=0.1, s
     rng.shuffle(rest)
     n_val = max(1, int(len(rest) * val_frac))
 
+    counts = dict(sorted(collections.Counter(labels.tolist()).items()))
     if len(ood) < min_ood_n:
         print(f"!! val_ood has only {len(ood)} images - too few for a stable metric. "
-              f"Cluster sizes: {dict(sorted(__import__('collections').Counter(labels.tolist()).items()))}")
+              f"Cluster sizes: {counts}")
+
+    gt_only = sorted(gt_only_stems or [])
+    train_paired = sorted(rest[n_val:])
 
     return {
-        "train": sorted(rest[n_val:]),
+        # real pairs only - these are the only images with genuine degraded input
+        "train": train_paired,
         "val_id": sorted(rest[:n_val]),
         "val_ood": sorted(ood),
+        # unpaired clean images: training exclusively, always via degrade()
+        "train_gt_only": gt_only,
         "clusters": {s: int(l) for s, l in zip(stems, labels)},
-        "ood_cluster": ood_cluster,
+        "cluster_sizes": counts,
+        "ood_cluster": int(ood_cluster),
         "seed": seed,
+        "counts": {
+            "train_paired": len(train_paired),
+            "val_id": n_val,
+            "val_ood": len(ood),
+            "train_gt_only": len(gt_only),
+            "real_share_of_train": round(
+                len(train_paired) / max(1, len(train_paired) + len(gt_only)), 4),
+        },
     }
 
 
