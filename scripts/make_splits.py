@@ -33,7 +33,8 @@ def main() -> int:
     # Unpaired clean images go to training wholesale. They cannot be validated
     # against - no real degraded counterpart exists, so scoring on them would
     # only measure how well the model inverts our own synthetic degradation.
-    gt_only = sorted(p.stem for p in list_images(gt_dir) if p.stem not in paired)
+    gt_only = sorted(p.stem for p in list_images(gt_dir, validate=True)
+                     if p.stem not in paired)
 
     print(f"paired images : {len(pairs)}")
     print(f"unpaired GT   : {len(gt_only)}  -> training only, via degrade()")

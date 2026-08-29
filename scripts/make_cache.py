@@ -39,7 +39,8 @@ def main() -> int:
         paired_stems = {p.stem for p, _ in pairs}
         # Round 2 ships far more clean images than pairs. Everything unpaired is
         # still usable through degrade(), so cache it as a separate pool.
-        gt_only = sorted(p for p in list_images(gt_dir) if p.stem not in paired_stems)
+        gt_only = sorted(p for p in list_images(gt_dir, validate=True)
+                         if p.stem not in paired_stems)
         print(f"caching {len(pairs)} pairs + {len(gt_only)} unpaired GT -> {cache_dir}")
         if gt_only:
             print(f"  unpaired GT is {len(gt_only)/(len(gt_only)+len(pairs))*100:.1f}% "

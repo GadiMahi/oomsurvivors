@@ -181,18 +181,59 @@ def round_trip_check(reference: str | Path, tol: float = 0.0) -> dict:
     }
 
 
-def list_images(directory: str | Path) -> list[Path]:
+def is_readable(path: str | Path) -> bool:
+    """Cheap check that a file is complete and loadable.
+
+    Datasets delivered as archives can contain zero-byte or half-written files
+    when the transfer was interrupted - the round-2 download left exactly one
+    such NoisyLR file. A single bad file crashes any script that iterates the
+    whole set, so every entry point filters through this.
+
+    Uses mmap for .npy (reads the header plus one element) rather than a full
+    load, so scanning thousands of files stays fast.
+    """
+    p = Path(path)
+    try:
+        if p.stat().st_size == 0:
+            return False
+        if p.suffix.lower() == ".npy":
+            a = np.load(p, mmap_mode="r")
+            if a.size == 0:
+                return False
+            _ = a.reshape(-1)[0]        # force a real read of the data region
+            return True
+        return load_image(p).size > 0
+    except Exception:
+        return False
+
+
+def list_images(directory: str | Path, validate: bool = False) -> list[Path]:
     directory = Path(directory)
     files = [p for p in sorted(directory.rglob("*")) if p.suffix.lower() in IMAGE_SUFFIXES]
+    if validate:
+        good = [p for p in files if is_readable(p)]
+        if len(good) != len(files):
+            bad = [p.name for p in files if p not in set(good)]
+            print(f"!! skipping {len(files) - len(good)} unreadable file(s) in "
+                  f"{directory.name}: {bad[:5]}{' ...' if len(bad) > 5 else ''}")
+        return good
     return files
 
 
-def pair_by_stem(gt_dir: str | Path, lr_dir: str | Path) -> list[tuple[Path, Path]]:
+def pair_by_stem(gt_dir: str | Path, lr_dir: str | Path,
+                 validate: bool = True) -> list[tuple[Path, Path]]:
     """Match GT and NoisyLR files on filename stem.
 
-    Returns only complete pairs; unmatched files are reported by the caller.
+    Returns only complete, readable pairs. Validation is ON by default: one
+    truncated file is enough to crash a full pass over the dataset, and the
+    round-2 delivery contains exactly that. Pass validate=False to skip the
+    check when you know the data is clean and want the extra speed.
+
+    Note the GT and LR counts are NOT expected to match in round 2 - KLA ships
+    4,785 clean images against 1,326 pairs deliberately, so the unpaired clean
+    images can be degraded synthetically.
     """
-    gt = {p.stem: p for p in list_images(gt_dir)}
-    lr = {p.stem: p for p in list_images(lr_dir)}
+    gt = {p.stem: p for p in list_images(gt_dir, validate=validate)}
+    lr = {p.stem: p for p in list_images(lr_dir, validate=validate)}
     common = sorted(set(gt) & set(lr))
     return [(gt[k], lr[k]) for k in common]
