@@ -118,6 +118,13 @@ loss:
   lpips: 0.05           # too high and it fights pixel fidelity
   edge: 0.5
   edge_weight_alpha: 4.0   # per-pixel Charbonnier weighting toward structure
+  spectral: 0.0            # frequency-domain loss. 0 = off.
+                           # Measured: the dim96 model retained only 28% of the
+                           # ground truth's high-frequency power - it erased 72%
+                           # of fine texture while scoring well on PSNR/SSIM.
+                           # Try 0.1-0.5 and watch SSIM-flat, which is where SEM
+                           # texture lives (edge SSIM misses this failure).
+  spectral_hi_from: 0.25   # only penalise the upper 75% of the spectrum
 
 inference:
   batch_size: 8

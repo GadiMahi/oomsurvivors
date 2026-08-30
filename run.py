@@ -31,6 +31,7 @@ import torch.nn.functional as F
 # Make the local `src` package importable regardless of CWD.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from src.model import build_model  # noqa: E402
+from src.tta import tta_forward   # noqa: E402
 
 SCALE = 2           # fixed by the trained checkpoint (512<->256 or 256<->128 SR factor)
 PAD_MULTIPLE = 2    # NAFNet_UNet has one stride-2 down/up level -> pad H,W to a multiple of 2
@@ -77,6 +78,10 @@ def main() -> int:
                          "then artifacts/best_nafnet.pt")
     ap.add_argument("--dim", type=int, default=None,
                     help="Model width. Read from the checkpoint when omitted.")
+    ap.add_argument("--tta", type=int, default=1, choices=[1, 4, 8],
+                    help="Test-time augmentation: 1 = off, 4 = rotations, "
+                         "8 = full dihedral group. Cost is linear; throughput "
+                         "is scored, so measure before enabling.")
     args = ap.parse_args()
 
     in_dir = Path(args.input_dir)
@@ -144,7 +149,7 @@ def main() -> int:
                 x = torch.from_numpy(batch_np).to(device, non_blocking=True)
 
                 xp, (ph, pw) = pad_to_multiple(x, PAD_MULTIPLE)
-                y = model(xp)
+                y = tta_forward(model, xp, args.tta, clamp=None) if args.tta > 1 else model(xp)
                 if ph or pw:
                     y = y[..., : y.shape[-2] - ph * SCALE, : y.shape[-1] - pw * SCALE]
 

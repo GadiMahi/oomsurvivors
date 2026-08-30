@@ -56,6 +56,39 @@ class CharbonnierLoss(nn.Module):
         return (d * weight).mean() if weight is not None else d.mean()
 
 
+class SpectralLoss(nn.Module):
+    """Penalise mismatch between the frequency spectra of prediction and target.
+
+    Motivation: a pixel loss is minimised by predicting the AVERAGE of all
+    plausible fine textures, which is smooth. Measured on the round-2 dim96
+    model, only 28% of the ground truth's high-frequency power survived - the
+    model erased 72% of the fine detail while scoring well on PSNR and SSIM,
+    because smoothing genuinely IS the error-minimising answer when detail is
+    ambiguous.
+
+    This term makes the smoothing explicitly costly. Comparing log-magnitudes
+    rather than raw ones keeps the low frequencies (which carry enormous power)
+    from dominating the gradient.
+
+    `hi_from` restricts the loss to the upper band, where the deficit is, so it
+    does not disturb the low frequencies the model already reproduces well.
+    """
+
+    def __init__(self, hi_from: float = 0.25):
+        super().__init__()
+        self.hi_from = hi_from
+
+    def forward(self, pred, target):
+        # FFT is unstable in fp16; force fp32 regardless of autocast.
+        with torch.autocast(pred.device.type, enabled=False):
+            p = torch.fft.rfft2(pred.float(), norm="ortho").abs()
+            t = torch.fft.rfft2(target.float(), norm="ortho").abs()
+            if self.hi_from > 0:
+                k = int(p.shape[-2] * self.hi_from)
+                p, t = p[..., k:, :], t[..., k:, :]
+            return F.l1_loss(torch.log1p(p), torch.log1p(t))
+
+
 class SobelEdgeLoss(nn.Module):
     def __init__(self):
         super().__init__()
@@ -215,6 +248,7 @@ def main() -> int:
 
     charb = CharbonnierLoss().to(device)
     sobel = SobelEdgeLoss().to(device)
+    spectral = SpectralLoss(cfg.get_path("loss.spectral_hi_from", 0.25)).to(device)
     lpips_fn = lpips.LPIPS(net=cfg.get_path("train.lpips_net", "vgg")).to(device).eval()
     for p in lpips_fn.parameters():
         p.requires_grad = False
@@ -222,6 +256,7 @@ def main() -> int:
     w_char = cfg.get_path("loss.charbonnier", 1.0)
     w_lpips = cfg.get_path("loss.lpips", 0.05)
     w_edge = cfg.get_path("loss.edge", 0.5)
+    w_spec = cfg.get_path("loss.spectral", 0.0)
     edge_alpha = cfg.get_path("loss.edge_weight_alpha", 4.0)
     clip = cfg.get_path("train.grad_clip", 1.0)
     cutblur_p = cfg.get_path("augment.cutblur_p", 0.5)
@@ -269,7 +304,9 @@ def main() -> int:
                 l_edge = sobel(pred, hr)
                 l_perc = lpips_fn(pred.clamp(0, 1).repeat(1, 3, 1, 1) * 2 - 1,
                                   hr.repeat(1, 3, 1, 1) * 2 - 1).mean()
-                loss = w_char * l_char + w_edge * l_edge + w_lpips * l_perc
+                l_spec = spectral(pred, hr) if w_spec > 0 else pred.new_zeros(())
+                loss = (w_char * l_char + w_edge * l_edge
+                        + w_lpips * l_perc + w_spec * l_spec)
 
             scaler.scale(loss).backward()
             if clip:
