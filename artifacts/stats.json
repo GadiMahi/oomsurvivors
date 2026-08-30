@@ -2,70 +2,112 @@
   "_comment": "Round 2 (SEM micrographs). Measured on 1325 verified pairs. See docs/ROUND2_EDA.md.",
   "dataset": "semicon_train_data",
   "round": 2,
-
   "scale_constant": 1.0,
   "log_transform": false,
   "log_eps": 0.01,
-  "gt_valid_range": [0.0, 1.0],
-
+  "gt_valid_range": [
+    0.0,
+    1.0
+  ],
   "gt_format": {
     "kind": "npy",
     "suffix": ".npy",
     "dtype": "float32",
     "scale": 1.0
   },
-
-  "n_pairs": 1325,
+  "n_pairs": 4785,
   "n_gt_total": 4785,
-  "n_gt_only": 3460,
-  "cv_image_means": 0.2580,
+  "n_gt_only": 0,
+  "cv_image_means": 0.258,
   "frac_lr_above_1": 0.01838,
   "frac_lr_below_0": 0.00088,
-
   "downsample_kernel": "gauss:0.6",
-  "kernels": ["gauss:0.5", "gauss:0.6", "gauss:0.7"],
-  "kernel_p": [0.25, 0.50, 0.25],
+  "kernels": [
+    "gauss:0.5",
+    "gauss:0.6",
+    "gauss:0.7"
+  ],
+  "kernel_p": [
+    0.25,
+    0.5,
+    0.25
+  ],
   "kernel_identification": {
     "method": "spectral distance + lag-1 autocorrelation + local variance",
     "note": "Round-1 low-pass MSE was insensitive by construction - it discards the band where kernels differ, which is why it wrongly reported 'unidentifiable'. Two independent statistics converge on sigma ~0.55-0.60.",
     "sweep": {
-      "decimate":  {"ac_diff": -0.0864, "lv_ratio": 1.159, "score": 0.6091},
-      "gauss:0.4": {"ac_diff": -0.0594, "lv_ratio": 1.116, "score": 0.4448},
-      "gauss:0.5": {"ac_diff": -0.0182, "lv_ratio": 1.045, "score": 0.3749},
-      "gauss:0.6": {"ac_diff":  0.0113, "lv_ratio": 1.004, "score": 0.2400},
-      "gauss:0.7": {"ac_diff":  0.0278, "lv_ratio": 0.971, "score": 0.2799},
-      "area":      {"ac_diff":  0.0500, "lv_ratio": 0.947, "score": 0.3334}
+      "decimate": {
+        "ac_diff": -0.0864,
+        "lv_ratio": 1.159,
+        "score": 0.6091
+      },
+      "gauss:0.4": {
+        "ac_diff": -0.0594,
+        "lv_ratio": 1.116,
+        "score": 0.4448
+      },
+      "gauss:0.5": {
+        "ac_diff": -0.0182,
+        "lv_ratio": 1.045,
+        "score": 0.3749
+      },
+      "gauss:0.6": {
+        "ac_diff": 0.0113,
+        "lv_ratio": 1.004,
+        "score": 0.24
+      },
+      "gauss:0.7": {
+        "ac_diff": 0.0278,
+        "lv_ratio": 0.971,
+        "score": 0.2799
+      },
+      "area": {
+        "ac_diff": 0.05,
+        "lv_ratio": 0.947,
+        "score": 0.3334
+      }
     },
     "residual_spectral_mismatch": 0.224,
     "residual_note": "spec.dist stays ~0.22 across every kernel, so the remaining high-frequency gap is NOT kernel-related. Most likely cause is per-pixel-independent noise sampling missing real spatial structure. Revisit only if training underperforms.",
     "removed": "bicubic_aa and lanczos destabilised the variance fit (local-variance ratios of 5.4 and 3864) and were the main source of the original synthetic/real mismatch."
   },
-
-  "order_mix": [0.1, 0.9],
-  "noise_autocorr_lag1": [-0.0500, -0.0516],
-
-  "_noise_fit_note": "Fitted against the identified kernel gauss:0.6 over 200 image pairs. The additive term is non-zero here but pinned to exactly 0 when fitted against the wrong ('area') kernel - independent evidence the kernel identification is correct, since the KLA spec states additive Gaussian noise is present.",
+  "order_mix": [
+    0.1,
+    0.9
+  ],
+  "noise_autocorr_lag1": [
+    -0.05,
+    -0.0516
+  ],
+  "_noise_fit_note": "Fitted against kernel gauss:0.6 on the FULL 4,785-pair dataset (300 images sampled). The additive term is non-zero, matching the KLA spec's statement that additive Gaussian noise is present; it pinned to exactly 0 when fitted against the wrong ('area') kernel, which is independent evidence the kernel identification is correct.",
   "noise_var_fit": {
-    "a_mult": 0.01334319090552458,
-    "b_poisson": 0.021085418144698703,
-    "c_additive": 0.000323866518105635
+    "a_mult": 0.023807,
+    "b_poisson": 0.010394,
+    "c_additive": 0.0030539
   },
-  "meas_mult": 0.11551273049116526,
-  "meas_add": 0.017996291787633224,
-  "noise_var_fit_previous_area_kernel": {
-    "a_mult": 2.5071e-02,
-    "b_poisson": 9.5974e-03,
-    "c_additive": 0.0,
-    "note": "Superseded. Kept for the record - shows how sensitive the variance decomposition is to the clean reference."
+  "meas_mult": 0.15429,
+  "meas_add": 0.055262,
+  "noise_var_fit_history": {
+    "area_kernel_1325_pairs": {
+      "a_mult": 0.025071,
+      "b_poisson": 0.0095974,
+      "c_additive": 0.0
+    },
+    "gauss06_kernel_1325_pairs": {
+      "a_mult": 0.013343,
+      "b_poisson": 0.021085,
+      "c_additive": 0.00032387
+    },
+    "note": "Superseded. Kept to show how sensitive the variance decomposition is to both the clean reference and the sample size - total variance at mid-intensity stayed near sigma 0.119 throughout while the decomposition shifted substantially."
   },
   "residual_bank": {
-    "n_residuals": 2362301,
-    "std": 1.0008,
-    "skew": 0.6640,
-    "excess_kurtosis": 2.1305,
-    "frac_beyond_3sigma": 0.008709,
-    "frac_beyond_5sigma": 0.000744,
-    "note": "Kurtosis 2.13 matches the 2.08 measured on raw residuals in the original EDA. Fitting against the wrong kernel had washed this out to 0.81."
+    "n_residuals": 2637598,
+    "std": 1.0103,
+    "skew": 0.8132,
+    "excess_kurtosis": 3.9193,
+    "frac_beyond_3sigma": 0.009625,
+    "frac_beyond_5sigma": 0.001144,
+    "note": "Built on the full 4,785-pair dataset. Heavier tails than the 1,325-pair estimate (kurtosis 3.92 vs 2.13) - more data samples the extremes better."
   },
   "synthetic_vs_real_validation": {
     "autocorr_lag1_diff": 0.0124,
@@ -75,37 +117,58 @@
     "frac_above1_real": 0.0102,
     "frac_above1_synth": 0.0093,
     "spectral_distance": 0.3258,
-    "before_kernel_fix": {"autocorr_lag1_diff": 0.1003, "local_variance_ratio": 0.863},
+    "before_kernel_fix": {
+      "autocorr_lag1_diff": 0.1003,
+      "local_variance_ratio": 0.863
+    },
     "note": "spectral_distance never discriminated between kernels (0.22-0.42 with no trend) and likely reflects the highest-frequency bins where absolute power is negligible. Revisit only if training underperforms."
   },
-  "residual_std": 0.10810,
+  "residual_std": 0.1081,
   "residual_skew": 0.5152,
   "residual_excess_kurtosis": 2.0798,
   "tail_frac_3sigma": 0.011412,
   "tail_frac_5sigma": 0.0005295,
   "overshoot_pred_vs_meas_ratio": 1.11,
-
-  "grad_thresh_gt_p40": 0.1222,
+  "grad_thresh_gt_p40": 0.116261,
   "grad_percentiles_gt": {
-    "p10": 0.0520, "p25": 0.0941, "p40": 0.1222,
-    "p50": 0.1403, "p75": 0.1837, "p90": 0.2228
+    "p10": 0.052,
+    "p25": 0.0941,
+    "p40": 0.1222,
+    "p50": 0.1403,
+    "p75": 0.1837,
+    "p90": 0.2228
   },
-
   "baseline_bicubic": {
-    "psnr": 20.4706,
-    "ssim": 0.5079,
-    "ssim_edge": 0.5964,
-    "ssim_flat": 0.4784,
-    "lpips": 0.4839
+    "psnr": 20.9426,
+    "ssim": 0.4441,
+    "ssim_edge": 0.5269,
+    "ssim_flat": 0.4165,
+    "lpips": 0.5248,
+    "lpips_vgg": 0.5248,
+    "lpips_alex": 0.5217,
+    "note": "val_ood = cluster 3 of the full 4,785-pair dataset (1,165 images)"
   },
-
   "round1_reference": {
     "meas_mult": 0.1431,
-    "noise_var_fit": {"a_mult": 2.0470e-02, "b_poisson": 5.8440e-03, "c_additive": 0.0},
+    "noise_var_fit": {
+      "a_mult": 0.02047,
+      "b_poisson": 0.005844,
+      "c_additive": 0.0
+    },
     "residual_std": 0.083,
-    "baseline_bicubic": {"psnr": 22.70, "ssim": 0.553, "lpips": 0.427},
+    "baseline_bicubic": {
+      "psnr": 22.7,
+      "ssim": 0.553,
+      "lpips": 0.427
+    },
     "note": "Natural photographs, not comparable to round-2 scores."
   },
-
-  "roundtrip_passed": true
+  "roundtrip_passed": true,
+  "baseline_bicubic_val_id": {
+    "psnr": 20.3106,
+    "ssim": 0.5318,
+    "ssim_edge": 0.6239,
+    "ssim_flat": 0.5011,
+    "note": "val_id is intrinsically EASIER content than val_ood - compare gains, not raw scores"
+  }
 }
