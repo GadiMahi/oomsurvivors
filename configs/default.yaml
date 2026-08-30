@@ -95,9 +95,24 @@ baseline:
 
 model:
   name: nafnet
-  dim: 64                # channel width. params ~ dim^2:
-                         #   48 -> 0.55M | 64 -> 0.98M | 96 -> 2.2M | 128 -> 3.9M
-                         # inference time is scored - measure it, don't assume
+  dim: 64                # channel width. params ~ dim^2. Round-2 finding:
+                         # dim 64 -> 96 gained +0.003 SSIM and no PSNR, so
+                         # capacity was NOT the constraint.
+  levels: 1              # U-Net depth = number of stride-2 stages.
+                         # Controls RECEPTIVE FIELD, which width does not.
+                         #   1 -> ~30px  (round-2 baseline)
+                         #   2 -> ~70px
+                         #   3 -> ~150px (exceeds the 128px training patch)
+                         # Input must be divisible by 2**levels.
+  blocks: 2              # NAFBlocks per encoder/decoder level
+  middle_blocks: 2       # NAFBlocks in the bottleneck
+                         # NOTE: pre-`levels` checkpoints are structurally
+                         # levels=1, blocks=2, middle_blocks=4. run.py detects
+                         # and remaps them automatically.
+                         #
+                         # width reference: 48 -> 0.55M | 64 -> 0.98M
+                         #                  96 -> 2.2M  | 128 -> 3.9M
+                         # inference time is scored - measure, don't assume.
 
 train:
   seed: 1337
@@ -130,4 +145,4 @@ inference:
   batch_size: 8
   device: cuda
   amp: true
-  pad_multiple: 8         # set by the model team (NAFNet stride)
+  pad_multiple: null      # unused: run.py computes 2**levels from the checkpoint

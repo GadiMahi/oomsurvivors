@@ -30,11 +30,11 @@ import torch.nn.functional as F
 
 # Make the local `src` package importable regardless of CWD.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from src.model import build_model  # noqa: E402
+from src.model import build_model, is_legacy_state_dict, remap_legacy_state_dict  # noqa: E402
 from src.tta import tta_forward   # noqa: E402
 
 SCALE = 2           # fixed by the trained checkpoint (512<->256 or 256<->128 SR factor)
-PAD_MULTIPLE = 2    # NAFNet_UNet has one stride-2 down/up level -> pad H,W to a multiple of 2
+PAD_MULTIPLE = None  # set from model depth at runtime: 2**levels
 
 # Look for weights in weights/ (for final submission) with a fallback to artifacts/ (for local Kaggle testing)
 BASE_DIR = Path(__file__).resolve().parent
@@ -78,6 +78,8 @@ def main() -> int:
                          "then artifacts/best_nafnet.pt")
     ap.add_argument("--dim", type=int, default=None,
                     help="Model width. Read from the checkpoint when omitted.")
+    ap.add_argument("--levels", type=int, default=None,
+                    help="U-Net depth. Inferred from the checkpoint when omitted.")
     ap.add_argument("--tta", type=int, default=1, choices=[1, 4, 8],
                     help="Test-time augmentation: 1 = off, 4 = rotations, "
                          "8 = full dihedral group. Cost is linear; throughput "
@@ -122,7 +124,21 @@ def main() -> int:
                 dim = int(state_dict["intro.weight"].shape[0])
     dim = dim or 64
 
-    model = build_model("nafnet", scale=SCALE, dim=dim).to(device).eval()
+    # Pre-`levels` checkpoints use the old layer names and are structurally
+    # equivalent to levels=1, blocks=2, middle_blocks=4.
+    levels, blocks, mblocks = args.levels, 2, 2
+    if state_dict is not None and is_legacy_state_dict(state_dict):
+        state_dict = remap_legacy_state_dict(state_dict)
+        levels, blocks, mblocks = 1, 2, 4
+        print("legacy checkpoint detected -> levels=1, blocks=2, middle_blocks=4")
+    elif state_dict is not None and levels is None:
+        # infer depth from how many encoder stages the checkpoint contains
+        levels = 1 + max((int(k.split(".")[1]) for k in state_dict
+                          if k.startswith("encoders.")), default=0)
+    levels = levels or 1
+
+    model = build_model("nafnet", scale=SCALE, dim=dim, levels=levels,
+                        blocks=blocks, middle_blocks=mblocks).to(device).eval()
 
     if state_dict is not None:
         model.load_state_dict(state_dict)
@@ -148,7 +164,7 @@ def main() -> int:
                 batch_np = np.stack([cache[f][0] for f in chunk])[:, None, :, :]  # (B,1,H,W)
                 x = torch.from_numpy(batch_np).to(device, non_blocking=True)
 
-                xp, (ph, pw) = pad_to_multiple(x, PAD_MULTIPLE)
+                xp, (ph, pw) = pad_to_multiple(x, 2 ** levels)
                 y = tta_forward(model, xp, args.tta, clamp=None) if args.tta > 1 else model(xp)
                 if ph or pw:
                     y = y[..., : y.shape[-2] - ph * SCALE, : y.shape[-1] - pw * SCALE]

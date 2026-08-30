@@ -234,9 +234,12 @@ def main() -> int:
 
     model = build_model(cfg.get_path("model.name", "nafnet"),
                         scale=cfg.get_path("dataset.scale", 2),
-                        dim=cfg.get_path("model.dim", 64)).to(device)
+                        dim=cfg.get_path("model.dim", 64),
+                        levels=cfg.get_path("model.levels", 1),
+                        blocks=cfg.get_path("model.blocks", 2),
+                        middle_blocks=cfg.get_path("model.middle_blocks", 2)).to(device)
     n_par = sum(p.numel() for p in model.parameters())
-    print(f"model: nafnet, {n_par/1e6:.2f}M parameters")
+    print(f"model: nafnet dim={cfg.get_path('model.dim', 64)} levels={cfg.get_path('model.levels', 1)}, {n_par/1e6:.2f}M params, receptive field ~{30 * 2 ** cfg.get_path('model.levels', 1) // 2}px")
 
     epochs = args.epochs or cfg.get_path("train.epochs", 80)
     lr0 = cfg.get_path("train.lr", 5e-4)
