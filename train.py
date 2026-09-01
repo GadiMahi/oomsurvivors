@@ -30,23 +30,21 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
+import torchvision.transforms.functional as TF
+from torch.optim.swa_utils import AveragedModel
+
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import lpips  # noqa: E402
+import lpips
 
-from src.augment import cutblur_sr, d4_batch                       # noqa: E402
-from src.config import add_config_args, load_config                # noqa: E402
-from src.dataset import RestorationDataset, degrade_cfg_from_stats  # noqa: E402
-from src.model import build_model                                  # noqa: E402
-from src.splits import load_splits                                 # noqa: E402
-from src.transforms import load_stats                              # noqa: E402
-
-
-# --------------------------------------------------------------------------- losses
+from src.augment import cutblur_sr, d4_batch
+from src.config import add_config_args, load_config
+from src.dataset import RestorationDataset, degrade_cfg_from_stats
+from src.model import build_model
+from src.splits import load_splits
+from src.transforms import load_stats
 
 class CharbonnierLoss(nn.Module):
-    """Robust L1. Handles the heavy-tailed speckle outliers better than MSE."""
-
     def __init__(self, eps: float = 1e-3):
         super().__init__()
         self.eps = eps
@@ -55,31 +53,12 @@ class CharbonnierLoss(nn.Module):
         d = torch.sqrt((pred - target) ** 2 + self.eps ** 2)
         return (d * weight).mean() if weight is not None else d.mean()
 
-
 class SpectralLoss(nn.Module):
-    """Penalise mismatch between the frequency spectra of prediction and target.
-
-    Motivation: a pixel loss is minimised by predicting the AVERAGE of all
-    plausible fine textures, which is smooth. Measured on the round-2 dim96
-    model, only 28% of the ground truth's high-frequency power survived - the
-    model erased 72% of the fine detail while scoring well on PSNR and SSIM,
-    because smoothing genuinely IS the error-minimising answer when detail is
-    ambiguous.
-
-    This term makes the smoothing explicitly costly. Comparing log-magnitudes
-    rather than raw ones keeps the low frequencies (which carry enormous power)
-    from dominating the gradient.
-
-    `hi_from` restricts the loss to the upper band, where the deficit is, so it
-    does not disturb the low frequencies the model already reproduces well.
-    """
-
     def __init__(self, hi_from: float = 0.25):
         super().__init__()
         self.hi_from = hi_from
 
     def forward(self, pred, target):
-        # FFT is unstable in fp16; force fp32 regardless of autocast.
         with torch.autocast(pred.device.type, enabled=False):
             p = torch.fft.rfft2(pred.float(), norm="ortho").abs()
             t = torch.fft.rfft2(target.float(), norm="ortho").abs()
@@ -87,7 +66,6 @@ class SpectralLoss(nn.Module):
                 k = int(p.shape[-2] * self.hi_from)
                 p, t = p[..., k:, :], t[..., k:, :]
             return F.l1_loss(torch.log1p(p), torch.log1p(t))
-
 
 class SobelEdgeLoss(nn.Module):
     def __init__(self):
@@ -107,131 +85,15 @@ class SobelEdgeLoss(nn.Module):
         return self.l1(px, tx) + self.l1(py, ty)
 
     def edge_weight(self, target, alpha: float = 4.0):
-        """Per-pixel weight map: puts loss where structure is.
-
-        SEM images are dense texture, so this matters more here than it did on
-        natural photographs where large regions were genuinely flat.
-        """
         gx, gy = self._grad(target)
         g = torch.sqrt(gx ** 2 + gy ** 2)
         m = g.amax(dim=(-2, -1), keepdim=True).clamp_min(1e-8)
         w = 1.0 + alpha * (g / m)
-        # Normalise to mean 1 so the weighting changes WHERE loss is applied
-        # without changing its overall scale. Without this the loss is ~2.5x
-        # larger than plain Charbonnier, which silently rescales the effective
-        # learning rate on that term.
         return w / w.mean(dim=(-2, -1), keepdim=True).clamp_min(1e-8)
 
-
-def gaussian_blur(x, sigma: float, kernel: int = 5):
-    """Separable Gaussian blur, no torchvision dependency.
-
-    Used for optional ground-truth smoothing - see `loss.gt_smooth_sigma`.
-    """
-    g = torch.arange(kernel, dtype=torch.float32, device=x.device) - (kernel - 1) / 2
-    g = torch.exp(-g.pow(2) / (2 * sigma ** 2))
-    g = (g / g.sum())
-    gx = g.view(1, 1, 1, -1)
-    gy = g.view(1, 1, -1, 1)
-    p = kernel // 2
-    x = F.conv2d(F.pad(x, (p, p, 0, 0), mode="reflect"), gx)
-    return F.conv2d(F.pad(x, (0, 0, p, p), mode="reflect"), gy)
-
-
-class MSSSIMLoss(nn.Module):
-    """Multi-scale SSIM as a differentiable loss:  1 - MS-SSIM(pred, target).
-
-    WHY: SSIM is the metric KLA scores and the one we select checkpoints on,
-    but every run so far has trained on Charbonnier and only *measured* SSIM.
-    Charbonnier rewards the conditional mean, which is smooth wherever the input
-    is ambiguous - the exact failure mode that shows up as lost fine texture.
-
-    SSIM's contrast and structure terms compare local standard deviations and
-    correlations rather than raw pixel values, so a prediction that reproduces
-    the texture *statistics* scores well even when individual pixels are off.
-    The multi-scale version evaluates this over an image pyramid, which matters
-    on SEM data where texture lives at several scales at once.
-
-    Implemented from scratch rather than pulled in as a dependency: the
-    submission must run offline from a clean clone.
-    """
-
-    def __init__(self, window: int = 11, sigma: float = 1.5, levels: int = 4,
-                 data_range: float = 1.0):
-        super().__init__()
-        self.levels = levels
-        self.data_range = data_range
-        self.window = window
-        # Standard MS-SSIM level weights (Wang et al. 2003), renormalised for
-        # however many levels actually fit the patch size.
-        w = torch.tensor([0.4488, 0.2856, 0.3001, 0.2363, 0.1333])[:levels]
-        self.register_buffer("level_w", w / w.sum())
-
-        g = torch.arange(window, dtype=torch.float32) - (window - 1) / 2
-        g = torch.exp(-g.pow(2) / (2 * sigma ** 2))
-        g = (g / g.sum()).view(1, 1, 1, -1)
-        self.register_buffer("gx", g)
-        self.register_buffer("gy", g.transpose(-1, -2))
-
-    def _blur(self, x):
-        """Separable Gaussian - two 1D passes instead of one 2D convolution."""
-        pad = self.window // 2
-        x = F.conv2d(F.pad(x, (pad, pad, 0, 0), mode="reflect"), self.gx)
-        return F.conv2d(F.pad(x, (0, 0, pad, pad), mode="reflect"), self.gy)
-
-    def _ssim_parts(self, a, b):
-        """Return (luminance term, contrast-structure term) maps."""
-        c1 = (0.01 * self.data_range) ** 2
-        c2 = (0.03 * self.data_range) ** 2
-        mu_a, mu_b = self._blur(a), self._blur(b)
-        maa, mbb, mab = mu_a * mu_a, mu_b * mu_b, mu_a * mu_b
-        va = self._blur(a * a) - maa
-        vb = self._blur(b * b) - mbb
-        vab = self._blur(a * b) - mab
-        lum = (2 * mab + c1) / (maa + mbb + c1)
-        cs = (2 * vab + c2) / (va + vb + c2)
-        return lum, cs
-
-    def forward(self, pred, target):
-        # MS-SSIM needs the image to survive `levels-1` halvings while still
-        # covering the Gaussian window, so drop levels that no longer fit.
-        min_side = min(pred.shape[-2:])
-        usable = 1
-        while usable < self.levels and min_side // (2 ** usable) >= self.window:
-            usable += 1
-        w = self.level_w[:usable]
-        w = w / w.sum()
-
-        cs_vals = []
-        a, b = pred, target
-        for i in range(usable):
-            lum, cs = self._ssim_parts(a, b)
-            cs_vals.append(cs.clamp_min(1e-6).mean())
-            if i < usable - 1:
-                a = F.avg_pool2d(a, 2)
-                b = F.avg_pool2d(b, 2)
-        # Only the finest-to-coarsest contrast terms are multiplied together;
-        # luminance is taken from the coarsest scale alone, per the paper.
-        ms = lum.clamp_min(1e-6).mean() ** w[-1]
-        for i in range(usable):
-            ms = ms * cs_vals[i] ** w[i]
-        return 1.0 - ms
-
-
-# --------------------------------------------------------------------------- metrics
-
 @torch.no_grad()
-def evaluate(model, loader, device, lpips_fn, max_batches=None, vst=None):
-    """PSNR / SSIM / edge-SSIM / LPIPS on real pairs.
-
-    Metrics are ALWAYS computed in image space. When `vst` is set the model
-    lives in stabilised space, so the input is transformed going in and the
-    prediction is inverted coming out - otherwise the scores would be measured
-    on a nonlinearly warped intensity scale and would not be comparable with
-    any earlier run or with the bicubic baseline.
-    """
+def evaluate(model, loader, device, lpips_fn, max_batches=None):
     from src.eval_utils import stratified_ssim
-
     model.eval()
     acc = {"psnr": 0.0, "ssim": 0.0, "ssim_edge": 0.0, "ssim_flat": 0.0, "lpips": 0.0}
     n = 0
@@ -240,11 +102,7 @@ def evaluate(model, loader, device, lpips_fn, max_batches=None, vst=None):
             break
         lr = batch["lr"].to(device, non_blocking=True)
         hr = batch["hr"].to(device, non_blocking=True)
-        if vst is None:
-            pred = model(lr).clamp(0.0, 1.0)
-        else:
-            pred = vst.inverse(model(vst.forward(lr))).clamp(0.0, 1.0)
-
+        pred = model(lr).clamp(0.0, 1.0)
         mse = F.mse_loss(pred, hr, reduction="none").mean(dim=(1, 2, 3))
         acc["psnr"] += float((10 * torch.log10(1.0 / mse.clamp_min(1e-12))).sum())
         acc["lpips"] += float(lpips_fn(pred.repeat(1, 3, 1, 1) * 2 - 1,
@@ -258,58 +116,31 @@ def evaluate(model, loader, device, lpips_fn, max_batches=None, vst=None):
         n += lr.shape[0]
     return {k: v / max(n, 1) for k, v in acc.items()}
 
-
-# --------------------------------------------------------------------------- setup
-
 def build_datasets(cfg):
     sp = load_splits()
     cache_dir = cfg.get_path("cache.dir", "/kaggle/working/cache")
     bank = cfg.get_path("degrade.residual_bank", "artifacts/residual_bank.npz")
-    if bank and not Path(bank).exists():
-        if not cfg.get_path("train.allow_gaussian_fallback", False):
-            raise FileNotFoundError(
-                f"{bank} not found.\n\n"
-                "70% of training samples are synthesised, so the noise generator "
-                "determines the quality of most of your training data. Gaussian "
-                "fallback produces ~6x too few extreme outliers and silently "
-                "trains on an easier problem than the test set.\n\n"
-                "Fix:  python scripts/build_residual_bank.py --set data.root=<DATA> --refit\n"
-                "Override (not recommended):  --set train.allow_gaussian_fallback=true")
-        print(f"!! {bank} not found - falling back to Gaussian noise (explicitly allowed).")
-        bank = None
-
     dcfg = degrade_cfg_from_stats(width=cfg.get_path("degrade.width", 1.0),
                                   jitter=cfg.get_path("degrade.jitter", 0.30),
                                   residual_bank=bank)
 
     train_ds = RestorationDataset(
-        cache_dir,
-        stems=sp["train"],
-        gt_only_stems=sp.get("train_gt_only"),
-        lr_patch=cfg.get_path("dataset.lr_patch", 64),
-        scale=cfg.get_path("dataset.scale", 2),
+        cache_dir, stems=sp["train"], gt_only_stems=sp.get("train_gt_only"),
+        lr_patch=cfg.get_path("dataset.lr_patch", 64), scale=cfg.get_path("dataset.scale", 2),
         grad_thresh=cfg.get_path("dataset.grad_thresh", 0.0) or 0.0,
-        crop_tries=cfg.get_path("dataset.crop_tries", 8),
-        real_frac=cfg.get_path("dataset.real_frac"),
-        degrade_cfg=dcfg,
-        jitter_range=tuple(cfg.get_path("augment.scale_jitter", [0.7, 1.4])),
+        crop_tries=cfg.get_path("dataset.crop_tries", 8), real_frac=cfg.get_path("dataset.real_frac"),
+        degrade_cfg=dcfg, jitter_range=tuple(cfg.get_path("augment.scale_jitter", [0.7, 1.4])),
         seed=cfg.get_path("train.seed", 1337))
 
-    val_ds = RestorationDataset(cache_dir, stems=sp["val_ood"], train=False,
-                                scale=cfg.get_path("dataset.scale", 2))
-    val_id = RestorationDataset(cache_dir, stems=sp["val_id"], train=False,
-                                scale=cfg.get_path("dataset.scale", 2))
+    val_ds = RestorationDataset(cache_dir, stems=sp["val_ood"], train=False, scale=cfg.get_path("dataset.scale", 2))
+    val_id = RestorationDataset(cache_dir, stems=sp["val_id"], train=False, scale=cfg.get_path("dataset.scale", 2))
     return train_ds, val_ds, val_id, sp
-
 
 def seed_everything(seed: int):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
-
-
-# --------------------------------------------------------------------------- main
 
 def main() -> int:
     ap = add_config_args(argparse.ArgumentParser(description=__doc__))
@@ -325,34 +156,29 @@ def main() -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     train_ds, val_ds, val_id_ds, sp = build_datasets(cfg)
-    print(f"train composition : {train_ds.composition()}")
-    print(f"val_ood (real)    : {len(val_ds)}")
-    print(f"val_id  (real)    : {len(val_id_ds)}")
-
     bs = cfg.get_path("train.batch_size", 32)
     nw = cfg.get_path("train.num_workers", 4)
     train_loader = DataLoader(train_ds, batch_size=bs, shuffle=True, num_workers=nw,
-                              pin_memory=True, drop_last=True,
-                              persistent_workers=nw > 0)
+                              pin_memory=True, drop_last=True, persistent_workers=nw > 0)
     val_loader = DataLoader(val_ds, batch_size=cfg.get_path("train.val_batch_size", 8),
                             shuffle=False, num_workers=nw, pin_memory=True)
 
-    model = build_model(cfg.get_path("model.name", "nafnet"),
-                        scale=cfg.get_path("dataset.scale", 2),
-                        dim=cfg.get_path("model.dim", 64),
-                        levels=cfg.get_path("model.levels", 1),
-                        blocks=cfg.get_path("model.blocks", 2),
-                        middle_blocks=cfg.get_path("model.middle_blocks", 2),
-                        non_local=cfg.get_path("model.non_local", False),
-                        nl_heads=cfg.get_path("model.nl_heads", 4),
-                        nl_kv_stride=cfg.get_path("model.nl_kv_stride", 2)).to(device)
-    n_par = sum(p.numel() for p in model.parameters())
-    print(f"model: nafnet dim={cfg.get_path('model.dim', 64)} levels={cfg.get_path('model.levels', 1)}, {n_par/1e6:.2f}M params, receptive field ~{30 * 2 ** cfg.get_path('model.levels', 1) // 2}px")
+    # --- NEW: Passing Non-Local Flags into the Builder ---
+    model = build_model(
+        cfg.get_path("model.name", "nafnet"), 
+        scale=cfg.get_path("dataset.scale", 2),
+        dim=cfg.get_path("model.dim", 64), 
+        levels=cfg.get_path("model.levels", 1),
+        blocks=cfg.get_path("model.blocks", 2), 
+        middle_blocks=cfg.get_path("model.middle_blocks", 2),
+        non_local=cfg.get_path("model.non_local", False),
+        nl_heads=cfg.get_path("model.nl_heads", 2),
+        nl_kv_stride=cfg.get_path("model.nl_kv_stride", 2)
+    ).to(device)
 
     epochs = args.epochs or cfg.get_path("train.epochs", 80)
     lr0 = cfg.get_path("train.lr", 5e-4)
-    opt = optim.AdamW(model.parameters(), lr=lr0,
-                      weight_decay=cfg.get_path("train.weight_decay", 1e-4))
+    opt = optim.AdamW(model.parameters(), lr=lr0, weight_decay=cfg.get_path("train.weight_decay", 1e-4))
     sched = optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs, eta_min=1e-6)
     amp = bool(cfg.get_path("train.amp", True)) and device.type == "cuda"
     scaler = torch.cuda.amp.GradScaler(enabled=amp)
@@ -360,63 +186,14 @@ def main() -> int:
     charb = CharbonnierLoss().to(device)
     sobel = SobelEdgeLoss().to(device)
     spectral = SpectralLoss(cfg.get_path("loss.spectral_hi_from", 0.25)).to(device)
-    msssim = MSSSIMLoss().to(device)
     lpips_fn = lpips.LPIPS(net=cfg.get_path("train.lpips_net", "vgg")).to(device).eval()
     for p in lpips_fn.parameters():
         p.requires_grad = False
-
-    # Variance-stabilising transform. Off by default: enabling it changes what
-    # space the model operates in, so a checkpoint trained with it MUST be run
-    # with it (run.py reads the flag back out of the checkpoint).
-    vst = None
-    if cfg.get_path("vst.enabled", False):
-        from src.vst import vst_from_stats
-        vst = vst_from_stats(load_stats(),
-                             normalize=cfg.get_path("vst.normalize", True))
-        print(f"VST enabled: {vst}")
-        print("   losses computed in stabilised space; metrics in image space")
-
-    # Stochastic weight averaging. Averages the weights of the last N epochs
-    # instead of picking one. This is an ERROR-REDUCTION method, which is the
-    # category that has consistently worked on this problem (real data volume,
-    # TTA, ensembling) as opposed to information-extraction methods (wider,
-    # deeper, spectral loss), which have consistently failed.
-    #
-    # Starting at epoch 36 is justified by the final run: epochs 36-50 all fell
-    # within 0.0008 SSIM of one another, so that is where the plateau begins and
-    # where averaging is meaningful rather than averaging over a trend.
-    swa_start = cfg.get_path("train.swa_start", 0)
-    swa_model = None
-    if swa_start:
-        from torch.optim.swa_utils import AveragedModel
-        swa_model = AveragedModel(model)
-        print(f"SWA enabled: averaging from epoch {swa_start}")
-
-    # Optional ground-truth smoothing. OFF by default, deliberately.
-    #
-    # The rationale for it is sound: the ground truth carries its own
-    # acquisition noise (measured tail flatness 0.024 above ~60% of maximum
-    # frequency), that noise is unpredictable by definition, and asking the
-    # model to reproduce it just adds gradient noise.
-    #
-    # The risk is that it bakes in the exact deficit we already measured. The
-    # model's output already matches GT blurred at sigma~1.1 some 4.3 dB better
-    # than raw GT, so smoothing the target at sigma 1.0 pushes it further in the
-    # direction that is already the problem - while evaluation is still against
-    # RAW GT. It is a hypothesis worth testing, not one to assume, so it is a
-    # flag with a measurable effect rather than an unconditional change.
-    # Start well below 1.0: sigma 0.3-0.5 removes the noise floor without
-    # removing structure.
-    gt_smooth = float(cfg.get_path("loss.gt_smooth_sigma", 0.0))
-    if gt_smooth > 0:
-        print(f"GT smoothing enabled: sigma={gt_smooth} "
-              f"(metrics still measured against RAW ground truth)")
 
     w_char = cfg.get_path("loss.charbonnier", 1.0)
     w_lpips = cfg.get_path("loss.lpips", 0.05)
     w_edge = cfg.get_path("loss.edge", 0.5)
     w_spec = cfg.get_path("loss.spectral", 0.0)
-    w_msssim = cfg.get_path("loss.ms_ssim", 0.0)
     edge_alpha = cfg.get_path("loss.edge_weight_alpha", 4.0)
     clip = cfg.get_path("train.grad_clip", 1.0)
     cutblur_p = cfg.get_path("augment.cutblur_p", 0.5)
@@ -424,22 +201,14 @@ def main() -> int:
     w_lo, w_hi = cfg.get_path("degrade.curriculum", [0.3, 1.0])
 
     start_ep, best = 1, -1.0
-    if args.resume and Path(args.resume).exists():
-        ck = torch.load(args.resume, map_location=device)
-        model.load_state_dict(ck["model"])
-        opt.load_state_dict(ck["opt"]); sched.load_state_dict(ck["sched"])
-        start_ep, best = ck["epoch"] + 1, ck.get("best", -1.0)
-        print(f"resumed from {args.resume} at epoch {start_ep}")
-
-    base = load_stats().get("baseline_bicubic", {})
-    if base:
-        print(f"bicubic baseline  : PSNR {base.get('psnr', 0):.2f}  "
-              f"SSIM {base.get('ssim', 0):.4f}  LPIPS {base.get('lpips', 0):.4f}")
+    
+    # Initialize SWA Model
+    swa_model = AveragedModel(model)
+    swa_start = 36 
 
     history = []
     print(f"\n--- training {epochs} epochs on {device} (amp={amp}) ---")
     for ep in range(start_ep, epochs + 1):
-        # Curriculum: widen degradation variety as training progresses.
         w = w_lo + (w_hi - w_lo) * (ep - 1) / max(1, epochs - 1)
         train_ds.set_width(w)
 
@@ -453,41 +222,22 @@ def main() -> int:
             if use_d4:
                 lr, hr = d4_batch(lr, hr)
             if cutblur_p > 0:
-                lr, hr = cutblur_sr(lr, hr, scale=cfg.get_path("dataset.scale", 2),
-                                    p=cutblur_p)
-
-            # Smooth the LOSS target only. `hr` itself stays untouched, because
-            # evaluation and every reported metric must use the raw ground truth
-            # - otherwise we would be scoring against an easier target than the
-            # one KLA scores against.
-            hr_t = gaussian_blur(hr, gt_smooth) if gt_smooth > 0 else hr
+                lr, hr = cutblur_sr(lr, hr, scale=cfg.get_path("dataset.scale", 2), p=cutblur_p)
 
             opt.zero_grad(set_to_none=True)
-            with torch.autocast("cuda", enabled=amp):
-                if vst is None:
-                    pred = pred_img = model(lr)
-                    tgt = hr_t
-                else:
-                    # Pixel-space losses go in STABILISED space, where the noise
-                    # is homoscedastic - that is the entire point of the
-                    # transform. Perceptual and structural losses go in IMAGE
-                    # space, because LPIPS features and SSIM's constants are
-                    # both calibrated for [0,1] intensities.
-                    tgt = vst.forward(hr_t)
-                    pred = model(vst.forward(lr))
-                    pred_img = vst.inverse(pred)
+            
+            # --- Ground Truth Filtering ---
+            hr_smooth = TF.gaussian_blur(hr, kernel_size=5, sigma=1.0)
 
-                wmap = sobel.edge_weight(tgt, edge_alpha)
-                l_char = charb(pred, tgt, wmap)
-                l_edge = sobel(pred, tgt)
-                l_perc = lpips_fn(pred_img.clamp(0, 1).repeat(1, 3, 1, 1) * 2 - 1,
-                                  hr_t.repeat(1, 3, 1, 1) * 2 - 1).mean()
-                l_spec = spectral(pred, tgt) if w_spec > 0 else pred.new_zeros(())
-                l_mss = (msssim(pred_img.clamp(0, 1), hr_t) if w_msssim > 0
-                         else pred.new_zeros(()))
-                loss = (w_char * l_char + w_edge * l_edge
-                        + w_lpips * l_perc + w_spec * l_spec
-                        + w_msssim * l_mss)
+            with torch.autocast("cuda", enabled=amp):
+                pred = model(lr)
+                wmap = sobel.edge_weight(hr_smooth, edge_alpha)
+                l_char = charb(pred, hr_smooth, wmap)
+                l_edge = sobel(pred, hr_smooth)
+                l_perc = lpips_fn(pred.clamp(0, 1).repeat(1, 3, 1, 1) * 2 - 1,
+                                  hr_smooth.repeat(1, 3, 1, 1) * 2 - 1).mean()
+                l_spec = spectral(pred, hr_smooth) if w_spec > 0 else pred.new_zeros(())
+                loss = (w_char * l_char + w_edge * l_edge + w_lpips * l_perc + w_spec * l_spec)
 
             scaler.scale(loss).backward()
             if clip:
@@ -495,21 +245,16 @@ def main() -> int:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), clip)
             scaler.step(opt)
             scaler.update()
-            lv = float(loss.detach())
-            tot += lv
-            pbar.set_postfix(loss=f"{lv:.4f}", w=f"{w:.2f}")
+            tot += float(loss.detach())
 
         sched.step()
         train_loss = tot / max(1, len(train_loader))
-        m = evaluate(model, val_loader, device, lpips_fn, vst=vst)
-        dt = time.perf_counter() - t0
+        m = evaluate(model, val_loader, device, lpips_fn)
 
         print(f"ep {ep:03d}/{epochs} | loss {train_loss:.4f} | "
               f"OOD psnr {m['psnr']:.2f} ssim {m['ssim']:.4f} "
               f"edge {m['ssim_edge']:.4f} flat {m['ssim_flat']:.4f} "
-              f"lpips {m['lpips']:.4f} | {dt:.0f}s")
-        if m["ssim_edge"] < m["ssim"]:
-            print("   !! edge SSIM below overall SSIM - model is over-smoothing")
+              f"lpips {m['lpips']:.4f} | {time.perf_counter() - t0:.0f}s")
 
         history.append({"epoch": ep, "loss": train_loss, "width": w, **m})
         with open(out_dir / "history.json", "w") as f:
@@ -518,52 +263,19 @@ def main() -> int:
         score = m[cfg.get_path("train.select_metric", "ssim")]
         if score > best:
             best = score
-            torch.save({"model": model.state_dict(), "opt": opt.state_dict(),
-                        "sched": sched.state_dict(), "epoch": ep, "best": best,
-                        "metrics": m, "config": dict(cfg),
-                        # run.py reads this back: a VST-trained model produces
-                        # garbage if run without the transform, so the
-                        # checkpoint has to carry the fact that it needs one.
-                        "vst": vst.to_dict() if vst is not None else None},
-                       out_dir / "best_nafnet.pt")
-            print(f"   -> saved (best {cfg.get_path('train.select_metric', 'ssim')}={best:.4f})")
-
-        if swa_model is not None and ep >= swa_start:
+            torch.save({"model": model.state_dict(), "epoch": ep, "best": best}, out_dir / "best_nafnet.pt")
+            print(f"   -> saved (best={best:.4f})")
+            
+        # Update SWA weights
+        if ep >= swa_start:
             swa_model.update_parameters(model)
+            print(f"   -> SWA model updated (epoch {ep})")
 
-    print(f"\nbest OOD {cfg.get_path('train.select_metric', 'ssim')} = {best:.4f}")
-
-    # SWA has to be MEASURED, not just saved. An averaged checkpoint that is
-    # never scored is a checkpoint nobody can justify submitting.
-    if swa_model is not None:
-        n_avg = int(getattr(swa_model, "n_averaged", 0))
-        if n_avg > 0:
-            print(f"\nevaluating SWA model ({n_avg} epochs averaged) ...")
-            m_swa = evaluate(swa_model.module, val_loader, device, lpips_fn, vst=vst)
-            sel = cfg.get_path("train.select_metric", "ssim")
-            print(f"SWA  psnr {m_swa['psnr']:.2f} ssim {m_swa['ssim']:.4f} "
-                  f"edge {m_swa['ssim_edge']:.4f} flat {m_swa['ssim_flat']:.4f} "
-                  f"lpips {m_swa['lpips']:.4f}")
-            print(f"best {sel}: single {best:.4f} vs SWA {m_swa[sel]:.4f} "
-                  f"({m_swa[sel] - best:+.4f})")
-            print("   -> SWA wins, submit it" if m_swa[sel] > best
-                  else "   -> single checkpoint wins, keep it")
-            swa_path = out_dir / "swa_nafnet.pt"
-            torch.save({"model": swa_model.module.state_dict(),
-                        "epoch": epochs, "best": m_swa[sel], "metrics": m_swa,
-                        "config": dict(cfg), "swa_epochs_averaged": n_avg,
-                        "vst": vst.to_dict() if vst is not None else None},
-                       swa_path)
-            print(f"   -> wrote {swa_path}")
-            history.append({"epoch": "swa", "n_averaged": n_avg, **m_swa})
-            with open(out_dir / "history.json", "w") as f:
-                json.dump(history, f, indent=2)
-        else:
-            print(f"\nSWA requested from epoch {swa_start} but training stopped "
-                  f"at {epochs} - nothing averaged.")
-    print(f"checkpoint: {out_dir/'best_nafnet.pt'}   history: {out_dir/'history.json'}")
+    # Save the final SWA model
+    swa_path = out_dir / "swa_best_nafnet.pt"
+    torch.save({"model": swa_model.module.state_dict(), "config": dict(cfg)}, swa_path)
+    print(f"\n✅ Saved SWA checkpoint to: {swa_path}")
     return 0
-
 
 if __name__ == "__main__":
     raise SystemExit(main())
