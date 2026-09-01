@@ -138,8 +138,17 @@ def main() -> int:
                           if k.startswith("encoders.")), default=0)
     levels = levels or 1
 
+    # A non-local checkpoint has attention weights the plain model lacks, so
+    # detect it from the state dict rather than needing a flag at the CLI.
+    non_local = any(".to_kv." in k for k in (state_dict or {}))
+    if non_local:
+        mblocks = max(mblocks, sum(1 for k in state_dict
+                                   if k.startswith("middle.") and k.endswith(".conv1.weight")))
+        print("non-local checkpoint detected -> attention block enabled")
+
     model = build_model("nafnet", scale=SCALE, dim=dim, levels=levels,
-                        blocks=blocks, middle_blocks=mblocks).to(device).eval()
+                        blocks=blocks, middle_blocks=mblocks,
+                        non_local=non_local).to(device).eval()
 
     if state_dict is not None:
         model.load_state_dict(state_dict)

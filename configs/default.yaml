@@ -104,6 +104,31 @@ model:
                          #   2 -> ~70px
                          #   3 -> ~150px (exceeds the 128px training patch)
                          # Input must be divisible by 2**levels.
+  # Non-local (self-attention) block at the bottleneck. OFF by default.
+  #
+  # Convolution can only see ~60px at levels=2, but SEM texture repeats across
+  # the whole frame. scripts/measure_recurrence.py measured the redundancy on
+  # all 4,785 pairs:
+  #     single noisy patch                 20.08 dB
+  #     avg of 16 spatial neighbours       21.54 dB  (+1.46)
+  #     avg of 16 MATCHED patches          23.42 dB  (+3.34)
+  #     avg of 16 patches, DIFFERENT image 18.09 dB  (-1.99)  <- control
+  # Oracle matching caps at +4.13 dB, and practical is only 0.79 dB behind it,
+  # so matches stay findable under noise.
+  #
+  # This is the one lever that adds INFORMATION rather than capacity - the
+  # category that failed every previous time (wider, deeper, spectral loss).
+  # It is spatial frame averaging: the same statistics that make repeated scans
+  # work, gathered from one frame instead of many.
+  #
+  # Expect ~2x noise reduction, not 16x: SEM texture recurs approximately.
+  # Attention is detected from the checkpoint, so run.py needs no flag.
+  non_local: false
+  nl_heads: 4
+  nl_kv_stride: 2        # pool keys/values by this factor. 1 = full attention
+                         # (accurate, but memory grows with the square of the
+                         # pixel count and 512px inputs become a problem).
+                         # 2 quarters the cost and keeps queries full-resolution.
   blocks: 2              # NAFBlocks per encoder/decoder level
   middle_blocks: 2       # NAFBlocks in the bottleneck
                          # NOTE: pre-`levels` checkpoints are structurally

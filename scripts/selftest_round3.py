@@ -147,6 +147,44 @@ def main() -> int:
     check("inverse(model(forward(x))) == x for identity model", err < 1e-4,
           f"max err {err:.2e}")
 
+    print("\n[7] Non-local attention block")
+    from src.model import build_model
+
+    plain = build_model("nafnet", scale=2, dim=24, levels=2, middle_blocks=2)
+    nl = build_model("nafnet", scale=2, dim=24, levels=2, middle_blocks=2,
+                     non_local=True)
+    n_plain = sum(p.numel() for p in plain.parameters())
+    n_nl = sum(p.numel() for p in nl.parameters())
+    check("adds parameters", n_nl > n_plain,
+          f"{n_plain/1e3:.1f}k -> {n_nl/1e3:.1f}k (+{100*(n_nl/n_plain-1):.1f}%)")
+
+    z = torch.rand(1, 1, 64, 64)
+    with torch.no_grad():
+        y_nl = nl(z)
+    check("output shape is 2x input", tuple(y_nl.shape) == (1, 1, 128, 128),
+          str(tuple(y_nl.shape)))
+    check("output is finite", bool(torch.isfinite(y_nl).all()))
+
+    # gamma is zero-initialised, so an untrained non-local block must be an
+    # exact no-op. If this fails the block can degrade a model at init.
+    nl.load_state_dict({k: v for k, v in plain.state_dict().items()},
+                       strict=False)
+    with torch.no_grad():
+        same = torch.allclose(nl(z), plain(z), atol=1e-5)
+    check("zero-init makes it an exact identity at start", same)
+
+    sizes_ok, notes = True, []
+    for s in (32, 64, 128):
+        try:
+            with torch.no_grad():
+                o = nl(torch.rand(1, 1, s, s))
+            sizes_ok &= tuple(o.shape) == (1, 1, s * 2, s * 2)
+            notes.append(f"{s}->{o.shape[-1]}")
+        except Exception as e:
+            sizes_ok = False
+            notes.append(f"{s}:{type(e).__name__}")
+    check("runs at varying input sizes", sizes_ok, " ".join(notes))
+
     print("\n" + "=" * 60)
     if failures:
         print(f"{len(failures)} CHECK(S) FAILED:")

@@ -55,9 +55,18 @@ def load_model(weights: Path, device):
         levels = 1 + max((int(k.split(".")[1]) for k in state
                           if k.startswith("encoders.")), default=0)
 
+    non_local = any(".to_kv." in k for k in state)
+    if non_local:
+        mblocks = max(mblocks, sum(1 for k in state if k.startswith("middle.")
+                                   and k.endswith(".conv1.weight")))
+
     model = build_model("nafnet", scale=2, dim=dim, levels=levels,
-                        blocks=blocks, middle_blocks=mblocks).to(device).eval()
+                        blocks=blocks, middle_blocks=mblocks,
+                        non_local=non_local).to(device).eval()
     model.load_state_dict(state)
+    if non_local:
+        print("non-local attention present - watch the 512 memory row, "
+              "attention cost grows faster than convolution")
 
     vst_cfg = sd.get("vst") if isinstance(sd, dict) else None
     if vst_cfg:

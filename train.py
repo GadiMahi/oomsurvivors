@@ -342,7 +342,10 @@ def main() -> int:
                         dim=cfg.get_path("model.dim", 64),
                         levels=cfg.get_path("model.levels", 1),
                         blocks=cfg.get_path("model.blocks", 2),
-                        middle_blocks=cfg.get_path("model.middle_blocks", 2)).to(device)
+                        middle_blocks=cfg.get_path("model.middle_blocks", 2),
+                        non_local=cfg.get_path("model.non_local", False),
+                        nl_heads=cfg.get_path("model.nl_heads", 4),
+                        nl_kv_stride=cfg.get_path("model.nl_kv_stride", 2)).to(device)
     n_par = sum(p.numel() for p in model.parameters())
     print(f"model: nafnet dim={cfg.get_path('model.dim', 64)} levels={cfg.get_path('model.levels', 1)}, {n_par/1e6:.2f}M params, receptive field ~{30 * 2 ** cfg.get_path('model.levels', 1) // 2}px")
 

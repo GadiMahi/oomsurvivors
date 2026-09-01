@@ -101,6 +101,86 @@ class NAFBlock(nn.Module):
         return identity2 + out * self.gamma
 
 
+class NonLocalBlock(nn.Module):
+    """Multi-head self-attention over the whole feature map.
+
+    WHY THIS IS HERE
+    ----------------
+    Everything else in this network is convolutional, so a pixel can only ever
+    be informed by its local neighbourhood - about 30px at levels=1, 60px at
+    levels=2. That is a hard architectural limit, not a capacity one, which is
+    why widening the model from dim 64 to 96 bought +0.003 SSIM and nothing else.
+
+    But SEM texture repeats. `scripts/measure_recurrence.py` measured this
+    directly on the full 4,785-pair dataset:
+
+        single noisy patch                    20.08 dB
+        average of 16 spatial neighbours      21.54 dB   (+1.46)
+        average of 16 MATCHED patches         23.42 dB   (+3.34)
+        average of 16 patches, OTHER image    18.09 dB   (-1.99)
+
+    The last line is the control: patches from a different image share the same
+    global brightness and contrast statistics, and averaging them makes things
+    worse. So the +3.34 dB is real structural matching, not coincidence. The
+    ceiling with oracle matching is +4.13 dB, and the gap to +3.34 is small,
+    meaning matches remain findable under noise.
+
+    That redundancy is unreachable by convolution. Attention reaches it: every
+    position attends to every other, so a noisy patch can average itself against
+    its recurrences anywhere in the frame. It is frame averaging performed in
+    space rather than in time - which matters because scan time is exactly the
+    constraint the whole problem exists to work around.
+
+    Expect roughly a 2x noise reduction, not 16x. Averaging 16 matches gave
+    2.16x, because SEM texture recurs approximately rather than identically.
+
+    COST
+    ----
+    Placed at the bottleneck, where resolution is lowest. `kv_stride` pools keys
+    and values so cost grows with (HW) x (HW/kv_stride^2) rather than (HW)^2,
+    which is what keeps a 512x512 input feasible. Queries stay at full
+    resolution, so every position still gets its own answer.
+
+    `gamma` is zero-initialised, so the block starts as an exact identity and
+    training decides how much to use it - the same convention NAFNet uses for
+    its residual scales. An untrained non-local block cannot make things worse.
+    """
+
+    def __init__(self, channels: int, heads: int = 4, kv_stride: int = 2):
+        super().__init__()
+        if channels % heads:
+            heads = 1
+        self.heads = heads
+        self.kv_stride = kv_stride
+        self.norm = LayerNorm2d(channels)
+        self.to_q = nn.Conv2d(channels, channels, 1, bias=False)
+        self.to_kv = nn.Conv2d(channels, channels * 2, 1, bias=False)
+        self.proj = nn.Conv2d(channels, channels, 1)
+        # Zero-init: block is an identity until training gives it a reason.
+        self.gamma = nn.Parameter(torch.zeros(1, channels, 1, 1))
+
+    def forward(self, x):
+        b, c, h, w = x.shape
+        y = self.norm(x)
+
+        q = self.to_q(y)
+        src = (F.avg_pool2d(y, self.kv_stride) if self.kv_stride > 1
+               and min(h, w) >= 2 * self.kv_stride else y)
+        k, v = self.to_kv(src).chunk(2, dim=1)
+
+        def heads_first(t):
+            bb, cc, hh, ww = t.shape
+            return t.reshape(bb, self.heads, cc // self.heads, hh * ww).transpose(-2, -1)
+
+        q, k, v = heads_first(q), heads_first(k), heads_first(v)
+        # SDPA picks a memory-efficient kernel, so the full attention matrix is
+        # never materialised. Without this a 512px input would need ~1 GB per
+        # head just to hold the scores.
+        o = F.scaled_dot_product_attention(q, k, v)
+        o = o.transpose(-2, -1).reshape(b, c, h, w)
+        return x + self.gamma * self.proj(o)
+
+
 class NAFNet_UNet(nn.Module):
     """NAFNet U-Net with a configurable number of encoder/decoder levels.
 
@@ -120,10 +200,12 @@ class NAFNet_UNet(nn.Module):
     """
 
     def __init__(self, in_channels=1, out_channels=1, dim=64, scale=2,
-                 levels=1, blocks=2, middle_blocks=2):
+                 levels=1, blocks=2, middle_blocks=2,
+                 non_local=False, nl_heads=4, nl_kv_stride=2):
         super().__init__()
         self.scale = scale
         self.levels = levels
+        self.non_local = bool(non_local)
 
         self.intro = nn.Conv2d(in_channels, dim, 3, 1, 1)
 
@@ -137,7 +219,19 @@ class NAFNet_UNet(nn.Module):
             c *= 2
 
         # ---- bottleneck -------------------------------------------------
-        self.middle = nn.Sequential(*[NAFBlock(c) for _ in range(middle_blocks)])
+        # The non-local block sits in the middle of the bottleneck stack: after
+        # some local processing has built useful features to match on, and with
+        # blocks after it to integrate whatever it gathered. Placing it here
+        # rather than at full resolution is what makes it affordable - at
+        # levels=2 a 128px input is 32x32 here, which is 1024 tokens.
+        mid = []
+        for i in range(middle_blocks):
+            mid.append(NAFBlock(c))
+            if self.non_local and i == middle_blocks // 2 - 1:
+                mid.append(NonLocalBlock(c, heads=nl_heads, kv_stride=nl_kv_stride))
+        if self.non_local and middle_blocks < 2:
+            mid.append(NonLocalBlock(c, heads=nl_heads, kv_stride=nl_kv_stride))
+        self.middle = nn.Sequential(*mid)
 
         # ---- decoder ----------------------------------------------------
         # Each level: PixelShuffle back up, concat the skip, 1x1 to merge.
@@ -230,7 +324,8 @@ def is_legacy_state_dict(sd: dict) -> bool:
 
 
 @register("nafnet")
-def _nafnet(scale=2, dim=64, levels=1, blocks=2, middle_blocks=2, **kwargs):
+def _nafnet(scale=2, dim=64, levels=1, blocks=2, middle_blocks=2,
+            non_local=False, nl_heads=4, nl_kv_stride=2, **kwargs):
     """Width AND depth are configurable so both can be swept.
 
     Round-2 finding: dim=96 (2.2x the parameters of dim=64) gained +0.003 SSIM
@@ -246,7 +341,9 @@ def _nafnet(scale=2, dim=64, levels=1, blocks=2, middle_blocks=2, **kwargs):
     """
     return NAFNet_UNet(in_channels=1, out_channels=1, dim=int(dim), scale=scale,
                        levels=int(levels), blocks=int(blocks),
-                       middle_blocks=int(middle_blocks))
+                       middle_blocks=int(middle_blocks),
+                       non_local=bool(non_local), nl_heads=int(nl_heads),
+                       nl_kv_stride=int(nl_kv_stride))
 
 
 @register("bicubic")
