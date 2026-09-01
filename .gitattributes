@@ -1,2 +1,2 @@
-*.pt filter=lfs diff=lfs merge=lfs -text
-weights/round2_dim96.pt -text
+*.pt -text
+*.npz -text

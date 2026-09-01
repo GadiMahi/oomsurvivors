@@ -1239,3 +1239,335 @@ over-smoothing.
 9. What does the flattening of the power spectrum at 0.4 imply about what the
    model is doing at high frequencies?
 10. Why can you not validate on synthetically degraded images?
+
+---
+
+# Part 8 — Deep dive: Fourier, blur, and why losses cause it
+
+This chapter covers the theory behind the day you discovered your model was
+erasing 72% of the fine detail. It is the most conceptually demanding material
+here and also the most useful, because it explains *why* the failure was
+inevitable rather than accidental.
+
+## 8.1 The Fourier transform, from scratch
+
+**The claim.** Any signal can be written as a sum of sine waves of different
+frequencies, amplitudes and phases. That is not obvious and it is not a
+convention — it is a theorem.
+
+```
+   a square-ish wave        =    sum of sines
+
+   ▁▁▁▔▔▔▁▁▁▔▔▔                  ∿∿∿∿∿∿∿∿      (low freq, big amplitude)
+                             +   ∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿   (3x freq, 1/3 amplitude)
+                             +   ∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿∿  (5x freq, 1/5)
+                             +   ...
+```
+
+Add enough terms and the sum converges to the original. The Fourier transform is
+just the recipe that tells you *how much* of each frequency you need.
+
+### You have already met this
+
+If you took a differential equations course, you saw Fourier series used to solve
+the heat equation. The reason it works there is worth carrying over.
+
+Differentiating a sine gives you a cosine of the same frequency; differentiating
+twice gives you the same sine scaled by −k². So sines are **eigenfunctions of the
+derivative operator** — differentiation doesn't change their shape, only their
+size. A hard differential equation becomes easy algebra once you rewrite the
+problem in terms of sines, because each frequency evolves independently.
+
+The same trick works in image processing for the same reason. Convolution — which
+is what every blur, sharpen and downsample kernel does — is also diagonalised by
+sines. Rewrite the image as frequencies and convolution stops being a messy
+sliding-window operation and becomes simple multiplication.
+
+### For images: spatial frequency
+
+A 1D signal varies over time. An image varies over *space*, so "frequency" means
+how rapidly brightness changes as you move across the picture.
+
+```
+   LOW spatial frequency            HIGH spatial frequency
+   ░░░░▒▒▒▒▓▓▓▓████                 ░█░█░█░█░█░█░█░█
+   slow, broad gradient             rapid alternation
+
+   in an SEM image:                 in an SEM image:
+   overall illumination,            grain, speckle, fine surface
+   large structures                 texture, edges, noise
+```
+
+A 2D image decomposes into 2D waves, each with a direction as well as a
+frequency. The 2D FFT you plotted shows how much energy sits at each. Because we
+usually don't care about direction, the *radial* profile averages over all
+orientations at each frequency, giving one curve.
+
+### The magnitude spectrum
+
+The transform gives complex numbers: a magnitude ("how much of this frequency")
+and a phase ("where its peaks sit"). Almost everything in this project uses only
+magnitude. Phase carries the positional information — famously, if you swap the
+magnitude and phase of two images, the result looks like the image whose *phase*
+you kept.
+
+---
+
+## 8.2 What blur is, in frequency terms
+
+**The convolution theorem:** convolution in space equals multiplication in
+frequency.
+
+```
+   blur(image)  =  image ⊛ kernel          (space: sliding window, expensive)
+                =  IFFT( FFT(image) × FFT(kernel) )   (frequency: one multiply)
+```
+
+A blur kernel — a Gaussian, say — has a Fourier transform that is near 1 at low
+frequencies and falls toward 0 at high ones. So blurring *multiplies away* the
+high frequencies. That is the whole of what blur is.
+
+```
+   FFT of a Gaussian blur kernel:
+
+    1.0 │▔▔▔▔▔▔╲
+        │       ╲___
+        │           ╲____
+    0.0 │                ╲________________
+        └────────────────────────────────► frequency
+         low freqs pass    high freqs are killed
+         through           ("low-pass filter")
+```
+
+**This is what your measurement showed.** When you plotted your model's output
+spectrum against the ground truth and found only 28% of the high-frequency power
+retained, you had measured an implicit low-pass filter. Nobody put a blur in the
+network. The training objective produced one.
+
+It also explains why the kernel identification in Part 2 mattered so much: an
+antialiased downsample is a low-pass filter applied *before* decimation, and a
+non-antialiased one is not. That difference lives entirely in the band a low-pass
+comparison throws away.
+
+---
+
+## 8.3 Why pixel losses blur — regression to the mean
+
+This is the deepest idea in this chapter, and it is a short proof.
+
+**Setup.** The model sees a noisy low-resolution input `x`. Many different clean
+images `y` could have produced it — the noise and downsampling destroyed the
+information needed to tell them apart. So given `x` there is a whole *probability
+distribution* of plausible answers, `p(y|x)`.
+
+**The question.** If you train with mean squared error, which single answer does
+the model learn to output?
+
+**The answer.** Minimise the expected squared error:
+
+```
+   minimise over ŷ:   E[ (y − ŷ)² | x ]
+
+   d/dŷ  E[(y − ŷ)²]  =  −2 E[y − ŷ]  =  0
+                      ⟹  ŷ  =  E[y | x]        the MEAN of all plausible answers
+```
+
+**Why the mean is smooth.** Suppose the true texture could equally plausibly be
+grain-shifted-left or grain-shifted-right. Both are sharp. Their average is not.
+
+```
+   plausible answer A:   ░█░█░█░█
+   plausible answer B:   █░█░█░█░
+   ────────────────────────────────
+   their average:        ▒▒▒▒▒▒▒▒     ← smooth, and it is what MSE asks for
+```
+
+The average of many sharp, mutually-inconsistent textures is a flat grey. **The
+model is not failing. It is producing exactly the answer the loss function
+requested.**
+
+**Does L1 or Charbonnier help?** A little. Minimising absolute error gives the
+**median** rather than the mean, which is less pulled around by outliers and
+usually a bit sharper. But the median of many misaligned textures is still
+smooth. Charbonnier behaves like L1 for large errors, so it inherits this. It
+softens the problem; it does not remove it.
+
+**Where the ambiguity comes from in your data.** You measured that above roughly
+0.4 of maximum frequency, your input contains only noise — the signal there was
+destroyed. So for that entire band, `p(y|x)` is genuinely broad, and the
+error-minimising output is genuinely smooth. Your model found the right answer to
+the question you asked.
+
+---
+
+## 8.4 The perception–distortion trade-off
+
+There is a formal result here, and it is worth knowing because it tells you the
+trade you are making cannot be avoided by cleverness.
+
+Blau and Michaeli (CVPR 2018) proved that **distortion** — how close your output
+is to the truth, measured by MSE, PSNR, and to a large extent SSIM — and
+**perceptual quality** — how much your output's *distribution* resembles the
+distribution of real images, which is roughly what LPIPS estimates — are in
+fundamental conflict. Improving one beyond a point necessarily worsens the other.
+
+```
+   perceptual
+    quality  │
+   (better ↑)│  ●  ← GAN-like: looks real, pixels wrong
+             │   ╲
+             │    ╲___          the FRONTIER: no model can be
+             │        ╲___      above and left of this curve
+             │            ╲___
+             │                ● ← MSE-trained: pixels right, looks blurry
+             └──────────────────────► distortion (worse →)
+```
+
+Your dim=64 model sits toward the bottom-right: excellent PSNR, blurry texture.
+The two experiments you launched — raising the LPIPS weight, adding a spectral
+loss — both move you up and to the left along this frontier. You will lose some
+PSNR. **That is not a bug in the experiment; it is the theorem.**
+
+The practical question is only *where on the curve to sit*, and since KLA scores
+a blend of PSNR, SSIM and LPIPS with undisclosed weights, the honest approach is
+to measure several points and be able to justify the choice.
+
+---
+
+## 8.5 The loss functions, mathematically
+
+### Charbonnier
+
+```
+   L = mean( sqrt( (pred − target)² + ε² ) ),      ε = 1e-3
+```
+
+Its gradient is what matters:
+
+```
+   dL/d(pred)  =  (pred − target) / sqrt((pred − target)² + ε²)
+```
+
+For large errors the denominator ≈ |error|, so the gradient tends to ±1 —
+constant, regardless of how large the error is. A single wild outlier pixel
+cannot dominate the update. Compare MSE, whose gradient is `2(pred − target)`
+and grows without bound.
+
+That property matters here specifically: you measured 5σ noise events occurring
+880 times more often than a Gaussian predicts. Under MSE, those rare violent
+pixels would dominate training and the model would smooth everything else to
+hedge against them.
+
+For small errors the denominator ≈ ε, so the gradient is ≈ error/ε — smoothly
+proportional. This is why ε exists: plain `|x|` has an undefined gradient at
+zero, and Charbonnier rounds off that corner.
+
+### Edge weighting
+
+```
+   w = 1 + α·(‖∇target‖ / max‖∇target‖),     α = 4
+   w = w / mean(w)                            ← normalisation
+   L = mean( charbonnier_per_pixel · w )
+```
+
+Loss is applied more heavily where the target has strong gradients. The
+normalisation matters more than it looks: without it the map averaged 2.12, so
+the loss was 2.12× larger than plain Charbonnier — which silently multiplies the
+effective learning rate on that term by the same factor. Dividing by the mean
+keeps the *relative* emphasis (still about 5.8× edge-versus-flat) while restoring
+the scale.
+
+### Sobel edge loss
+
+```
+   Sx = [-1 0 1]     Sy = [-1 -2 -1]
+        [-2 0 2]          [ 0  0  0]
+        [-1 0 1]          [ 1  2  1]
+
+   L = |Sx*pred − Sx*target|₁ + |Sy*pred − Sy*target|₁
+```
+
+These approximate ∂/∂x and ∂/∂y. Comparing derivatives rather than values
+penalises blur directly: a blurred edge has a smaller gradient, and this notices
+even when the absolute intensities are close.
+
+### LPIPS
+
+```
+   feats_p = VGG(pred)      at layers 1..5
+   feats_t = VGG(target)    at layers 1..5
+
+   L = Σ_layers  w_l · ‖ normalise(feats_p^l) − normalise(feats_t^l) ‖²
+```
+
+The `w_l` are not hand-chosen. They were **fitted to human judgements**: people
+were shown image triplets and asked which of two candidates looked more like the
+reference, and the layer weights were optimised to agree with those answers.
+
+Why it resists the blur problem: VGG features respond to the *presence of
+texture*, not its exact position. A sharp texture shifted by one pixel produces
+nearly identical features, while a smooth patch produces very different ones. So
+LPIPS does not reward averaging away detail the way a pixel loss does — the
+average of two shifted textures looks, in feature space, nothing like either.
+
+The caveat for your project: VGG learned its features from natural photographs.
+Whether "perceptually similar" transfers cleanly to electron micrographs is
+genuinely uncertain. KLA scores it, so optimise it, but hold it loosely as
+evidence about visual quality here.
+
+### Spectral loss
+
+```
+   P = |FFT(pred)|,  T = |FFT(target)|
+   keep only the upper band (hi_from = 0.25)
+   L = mean( | log(1+P) − log(1+T) | )
+```
+
+Three deliberate choices.
+
+**Magnitude only, no phase.** Phase says where texture sits; magnitude says how
+much of it there is. You want to force the model to *produce* fine detail, not to
+place every grain exactly — that would be as impossible as the original problem.
+
+**Log rather than raw magnitude.** Low frequencies carry orders of magnitude more
+power, so a raw-magnitude loss would be dominated by them and ignore precisely
+the band you care about. The log compresses that range.
+
+**Upper band only.** The low frequencies are already reproduced well, and
+penalising them again just adds noise to the gradient.
+
+Tested against progressively blurrier predictions, the loss rises steeply
+(0.017 → 0.046 → 0.062 for increasing blur) — which is the point. It makes
+smoothing expensive in a way the pixel loss cannot.
+
+### The combination
+
+```
+   L = 1.0 · charbonnier_edge_weighted     pixel accuracy   → PSNR
+     + 0.5 · sobel                          sharpness        → SSIM
+     + 0.05 · LPIPS                         perceptual       → LPIPS
+     [+ w · spectral]                       texture energy   → the 72% deficit
+```
+
+Every term is a statement about which point on the perception–distortion frontier
+you want. The weights are the actual design decision; the individual losses are
+just the vocabulary for expressing it.
+
+---
+
+## Questions for this chapter
+
+1. Why are sine waves special for both differential equations and image
+   convolution? What property do they share in both settings?
+2. State the convolution theorem, and use it to explain what blurring does to an
+   image's spectrum.
+3. Show that minimising expected squared error yields the conditional mean.
+   Why does that produce blur?
+4. Why does L1 (or Charbonnier) blur less than MSE, and why does it still blur?
+5. What does the perception–distortion trade-off say about a model that claims
+   the best PSNR *and* the most realistic texture?
+6. Why does the spectral loss compare log-magnitudes rather than magnitudes,
+   and why does it ignore phase?
+7. Your model retained 28% of high-frequency power. Explain that as an implicit
+   filter, and say what the filter's frequency response must look like.
+8. Why is LPIPS less vulnerable to regression-to-the-mean than Charbonnier?

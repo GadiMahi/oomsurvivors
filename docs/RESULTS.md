@@ -140,6 +140,44 @@ is irreducible. This bounds what any model can achieve on this dataset and
 explains why capacity, data volume and loss modifications all plateaued at
 similar points.
 
+### Runs 6 and 7 — architecture sweep: depth vs width
+
+Motivation: `dim=96` (2.2x params) gained nothing over `dim=64`, suggesting
+capacity was not the constraint. Width does not extend receptive field, so the
+hypothesis was that **depth** — the number of stride-2 U-Net levels — was the
+real limitation. The original architecture had only ONE level (~30px receptive
+field) where NAFNet normally uses three or four.
+
+`dim=48, levels=2` (1.93M) was chosen to sit at almost exactly the same
+parameter budget as `dim=96, levels=1` (2.14M), isolating depth from capacity.
+
+| model | params | RF | PSNR | SSIM | edge | flat | LPIPS |
+|---|---|---|---|---|---|---|---|
+| bicubic | — | — | 20.94 | 0.4441 | 0.5269 | 0.4165 | 0.5248 |
+| dim64 L1 | 0.98M | 30px | **23.94** | 0.5034 | 0.5597 | 0.4814 | 0.3655 |
+| dim96 L1 | 2.14M | 30px | 23.93 | 0.5064 | 0.5651 | 0.4842 | **0.3610** |
+| dim48 L2 | 1.93M | 60px | 23.89 | 0.5054 | 0.5670 | 0.4849 | 0.3723 |
+| dim64 L2 | 3.42M | 60px | 23.90 | **0.5074** | **0.5691** | **0.4869** | 0.3673 |
+
+**Result: neither depth nor width is the bottleneck.** Across a 3.5x parameter
+range and a 2x receptive-field range, every model lands within **0.05 dB PSNR**
+and **0.004 SSIM** of the others.
+
+Depth does help the structural metrics marginally — both two-level models have
+better edge and flat SSIM than any one-level model — but the effect is far too
+small to matter. At equal parameter budget (1.93M vs 2.14M), depth and width
+perform identically.
+
+**Taken with the GT noise-floor measurement, this is a coherent story:** a fixed
+fraction of the residual error against ground truth is irreducible acquisition
+noise, so architectural capacity cannot reach it. Four architectures, two
+loss modifications and a 3.5x capacity range all converge to the same ceiling.
+
+**Submission implication:** `dim=64 levels=1` at 0.98M has the best PSNR, the
+fewest parameters and the fastest inference (12.2 ms/image measured). Since
+throughput is scored and the quality spread is 0.004 SSIM, it is the correct
+submission choice unless inference timings say otherwise.
+
 ### Not yet tried (as of version 3)
 
 Reviewing what has actually been explored: data volume (large gain, banked),
