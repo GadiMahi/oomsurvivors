@@ -123,11 +123,98 @@ class SobelEdgeLoss(nn.Module):
         return w / w.mean(dim=(-2, -1), keepdim=True).clamp_min(1e-8)
 
 
+class MSSSIMLoss(nn.Module):
+    """Multi-scale SSIM as a differentiable loss:  1 - MS-SSIM(pred, target).
+
+    WHY: SSIM is the metric KLA scores and the one we select checkpoints on,
+    but every run so far has trained on Charbonnier and only *measured* SSIM.
+    Charbonnier rewards the conditional mean, which is smooth wherever the input
+    is ambiguous - the exact failure mode that shows up as lost fine texture.
+
+    SSIM's contrast and structure terms compare local standard deviations and
+    correlations rather than raw pixel values, so a prediction that reproduces
+    the texture *statistics* scores well even when individual pixels are off.
+    The multi-scale version evaluates this over an image pyramid, which matters
+    on SEM data where texture lives at several scales at once.
+
+    Implemented from scratch rather than pulled in as a dependency: the
+    submission must run offline from a clean clone.
+    """
+
+    def __init__(self, window: int = 11, sigma: float = 1.5, levels: int = 4,
+                 data_range: float = 1.0):
+        super().__init__()
+        self.levels = levels
+        self.data_range = data_range
+        self.window = window
+        # Standard MS-SSIM level weights (Wang et al. 2003), renormalised for
+        # however many levels actually fit the patch size.
+        w = torch.tensor([0.4488, 0.2856, 0.3001, 0.2363, 0.1333])[:levels]
+        self.register_buffer("level_w", w / w.sum())
+
+        g = torch.arange(window, dtype=torch.float32) - (window - 1) / 2
+        g = torch.exp(-g.pow(2) / (2 * sigma ** 2))
+        g = (g / g.sum()).view(1, 1, 1, -1)
+        self.register_buffer("gx", g)
+        self.register_buffer("gy", g.transpose(-1, -2))
+
+    def _blur(self, x):
+        """Separable Gaussian - two 1D passes instead of one 2D convolution."""
+        pad = self.window // 2
+        x = F.conv2d(F.pad(x, (pad, pad, 0, 0), mode="reflect"), self.gx)
+        return F.conv2d(F.pad(x, (0, 0, pad, pad), mode="reflect"), self.gy)
+
+    def _ssim_parts(self, a, b):
+        """Return (luminance term, contrast-structure term) maps."""
+        c1 = (0.01 * self.data_range) ** 2
+        c2 = (0.03 * self.data_range) ** 2
+        mu_a, mu_b = self._blur(a), self._blur(b)
+        maa, mbb, mab = mu_a * mu_a, mu_b * mu_b, mu_a * mu_b
+        va = self._blur(a * a) - maa
+        vb = self._blur(b * b) - mbb
+        vab = self._blur(a * b) - mab
+        lum = (2 * mab + c1) / (maa + mbb + c1)
+        cs = (2 * vab + c2) / (va + vb + c2)
+        return lum, cs
+
+    def forward(self, pred, target):
+        # MS-SSIM needs the image to survive `levels-1` halvings while still
+        # covering the Gaussian window, so drop levels that no longer fit.
+        min_side = min(pred.shape[-2:])
+        usable = 1
+        while usable < self.levels and min_side // (2 ** usable) >= self.window:
+            usable += 1
+        w = self.level_w[:usable]
+        w = w / w.sum()
+
+        cs_vals = []
+        a, b = pred, target
+        for i in range(usable):
+            lum, cs = self._ssim_parts(a, b)
+            cs_vals.append(cs.clamp_min(1e-6).mean())
+            if i < usable - 1:
+                a = F.avg_pool2d(a, 2)
+                b = F.avg_pool2d(b, 2)
+        # Only the finest-to-coarsest contrast terms are multiplied together;
+        # luminance is taken from the coarsest scale alone, per the paper.
+        ms = lum.clamp_min(1e-6).mean() ** w[-1]
+        for i in range(usable):
+            ms = ms * cs_vals[i] ** w[i]
+        return 1.0 - ms
+
+
 # --------------------------------------------------------------------------- metrics
 
 @torch.no_grad()
-def evaluate(model, loader, device, lpips_fn, max_batches=None):
-    """PSNR / SSIM / edge-SSIM / LPIPS on real pairs."""
+def evaluate(model, loader, device, lpips_fn, max_batches=None, vst=None):
+    """PSNR / SSIM / edge-SSIM / LPIPS on real pairs.
+
+    Metrics are ALWAYS computed in image space. When `vst` is set the model
+    lives in stabilised space, so the input is transformed going in and the
+    prediction is inverted coming out - otherwise the scores would be measured
+    on a nonlinearly warped intensity scale and would not be comparable with
+    any earlier run or with the bicubic baseline.
+    """
     from src.eval_utils import stratified_ssim
 
     model.eval()
@@ -138,7 +225,10 @@ def evaluate(model, loader, device, lpips_fn, max_batches=None):
             break
         lr = batch["lr"].to(device, non_blocking=True)
         hr = batch["hr"].to(device, non_blocking=True)
-        pred = model(lr).clamp(0.0, 1.0)
+        if vst is None:
+            pred = model(lr).clamp(0.0, 1.0)
+        else:
+            pred = vst.inverse(model(vst.forward(lr))).clamp(0.0, 1.0)
 
         mse = F.mse_loss(pred, hr, reduction="none").mean(dim=(1, 2, 3))
         acc["psnr"] += float((10 * torch.log10(1.0 / mse.clamp_min(1e-12))).sum())
@@ -252,14 +342,27 @@ def main() -> int:
     charb = CharbonnierLoss().to(device)
     sobel = SobelEdgeLoss().to(device)
     spectral = SpectralLoss(cfg.get_path("loss.spectral_hi_from", 0.25)).to(device)
+    msssim = MSSSIMLoss().to(device)
     lpips_fn = lpips.LPIPS(net=cfg.get_path("train.lpips_net", "vgg")).to(device).eval()
     for p in lpips_fn.parameters():
         p.requires_grad = False
+
+    # Variance-stabilising transform. Off by default: enabling it changes what
+    # space the model operates in, so a checkpoint trained with it MUST be run
+    # with it (run.py reads the flag back out of the checkpoint).
+    vst = None
+    if cfg.get_path("vst.enabled", False):
+        from src.vst import vst_from_stats
+        vst = vst_from_stats(load_stats(),
+                             normalize=cfg.get_path("vst.normalize", True))
+        print(f"VST enabled: {vst}")
+        print("   losses computed in stabilised space; metrics in image space")
 
     w_char = cfg.get_path("loss.charbonnier", 1.0)
     w_lpips = cfg.get_path("loss.lpips", 0.05)
     w_edge = cfg.get_path("loss.edge", 0.5)
     w_spec = cfg.get_path("loss.spectral", 0.0)
+    w_msssim = cfg.get_path("loss.ms_ssim", 0.0)
     edge_alpha = cfg.get_path("loss.edge_weight_alpha", 4.0)
     clip = cfg.get_path("train.grad_clip", 1.0)
     cutblur_p = cfg.get_path("augment.cutblur_p", 0.5)
@@ -301,15 +404,30 @@ def main() -> int:
 
             opt.zero_grad(set_to_none=True)
             with torch.autocast("cuda", enabled=amp):
-                pred = model(lr)
-                wmap = sobel.edge_weight(hr, edge_alpha)
-                l_char = charb(pred, hr, wmap)
-                l_edge = sobel(pred, hr)
-                l_perc = lpips_fn(pred.clamp(0, 1).repeat(1, 3, 1, 1) * 2 - 1,
+                if vst is None:
+                    pred = pred_img = model(lr)
+                    tgt = hr
+                else:
+                    # Pixel-space losses go in STABILISED space, where the noise
+                    # is homoscedastic - that is the entire point of the
+                    # transform. Perceptual and structural losses go in IMAGE
+                    # space, because LPIPS features and SSIM's constants are
+                    # both calibrated for [0,1] intensities.
+                    tgt = vst.forward(hr)
+                    pred = model(vst.forward(lr))
+                    pred_img = vst.inverse(pred)
+
+                wmap = sobel.edge_weight(tgt, edge_alpha)
+                l_char = charb(pred, tgt, wmap)
+                l_edge = sobel(pred, tgt)
+                l_perc = lpips_fn(pred_img.clamp(0, 1).repeat(1, 3, 1, 1) * 2 - 1,
                                   hr.repeat(1, 3, 1, 1) * 2 - 1).mean()
-                l_spec = spectral(pred, hr) if w_spec > 0 else pred.new_zeros(())
+                l_spec = spectral(pred, tgt) if w_spec > 0 else pred.new_zeros(())
+                l_mss = (msssim(pred_img.clamp(0, 1), hr) if w_msssim > 0
+                         else pred.new_zeros(()))
                 loss = (w_char * l_char + w_edge * l_edge
-                        + w_lpips * l_perc + w_spec * l_spec)
+                        + w_lpips * l_perc + w_spec * l_spec
+                        + w_msssim * l_mss)
 
             scaler.scale(loss).backward()
             if clip:
@@ -323,7 +441,7 @@ def main() -> int:
 
         sched.step()
         train_loss = tot / max(1, len(train_loader))
-        m = evaluate(model, val_loader, device, lpips_fn)
+        m = evaluate(model, val_loader, device, lpips_fn, vst=vst)
         dt = time.perf_counter() - t0
 
         print(f"ep {ep:03d}/{epochs} | loss {train_loss:.4f} | "
@@ -342,7 +460,11 @@ def main() -> int:
             best = score
             torch.save({"model": model.state_dict(), "opt": opt.state_dict(),
                         "sched": sched.state_dict(), "epoch": ep, "best": best,
-                        "metrics": m, "config": dict(cfg)},
+                        "metrics": m, "config": dict(cfg),
+                        # run.py reads this back: a VST-trained model produces
+                        # garbage if run without the transform, so the
+                        # checkpoint has to carry the fact that it needs one.
+                        "vst": vst.to_dict() if vst is not None else None},
                        out_dir / "best_nafnet.pt")
             print(f"   -> saved (best {cfg.get_path('train.select_metric', 'ssim')}={best:.4f})")
 

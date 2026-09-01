@@ -37,7 +37,13 @@ def tta_forward(model, x: torch.Tensor, n_transforms: int = 8,
                 clamp: tuple[float, float] | None = (0.0, 1.0)) -> torch.Tensor:
     """Average the model's predictions over n_transforms D4 orientations.
 
-    n_transforms:  1 = no TTA, 4 = rotations only, 8 = full group.
+    n_transforms:  1 = no TTA, 2 = identity + 180 deg, 4 = rotations only,
+                   8 = full group.
+
+    The n=2 option exists because the measured 1 -> 4 gain (+0.18 dB, +0.011
+    SSIM) is large while 4 -> 8 is negligible (+0.0003 SSIM), which leaves open
+    where between 1 and 4 the benefit actually arrives. Two transforms cost
+    roughly 19 ms/image against 34 ms for four.
 
     Rotations and flips commute with 2x upsampling, so the same transform index
     applies to input and output despite the resolution change.
@@ -46,17 +52,19 @@ def tta_forward(model, x: torch.Tensor, n_transforms: int = 8,
         out = model(x)
         return out.clamp(*clamp) if clamp else out
 
-    idx = range(4) if n_transforms == 4 else range(8)
+    # 180 deg (index 2) is chosen for n=2 because it shares no axis alignment
+    # with the identity, so the two error realisations are maximally different.
+    idx = {2: (0, 2), 4: (0, 1, 2, 3)}.get(n_transforms, tuple(range(8)))
     acc = None
     for i in idx:
         pred = _invert(model(_apply(x, i)), i)
         acc = pred if acc is None else acc + pred
-    out = acc / len(list(idx))
+    out = acc / len(idx)
     return out.clamp(*clamp) if clamp else out
 
 
 @torch.no_grad()
-def compare_tta(model, loader, device, lpips_fn=None, variants=(1, 4, 8)) -> dict:
+def compare_tta(model, loader, device, lpips_fn=None, variants=(1, 2, 4, 8)) -> dict:
     """Measure quality and wall-clock cost for each TTA setting.
 
     Returns {n: {psnr, ssim, ssim_edge, lpips, seconds, ms_per_image}} so the

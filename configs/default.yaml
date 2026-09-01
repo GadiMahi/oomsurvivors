@@ -140,6 +140,31 @@ loss:
                            # Try 0.1-0.5 and watch SSIM-flat, which is where SEM
                            # texture lives (edge SSIM misses this failure).
   spectral_hi_from: 0.25   # only penalise the upper 75% of the spectrum
+  ms_ssim: 0.0             # multi-scale SSIM loss. 0 = off.
+                           # SSIM is the metric KLA scores and the one we
+                           # select checkpoints on, but no run has ever trained
+                           # on it directly. Its contrast/structure terms
+                           # compare local statistics rather than raw pixels,
+                           # which is what the "texture read as noise" problem
+                           # actually calls for. Try 0.2-0.5 and watch PSNR,
+                           # which it will cost something.
+
+# Generalised Anscombe variance-stabilising transform. OFF by default.
+# Derived from the measured fit var(y) = a*y^2 + b*y + c, so it needs no new
+# constants - see src/vst.py for the algebra and `python -m src.vst` to verify.
+#
+# WHAT IT FIXES: bright pixels carry ~12x the noise variance of dark ones, but
+# Charbonnier weights every pixel equally, so the loss is dominated by bright
+# regions purely because they are noisier. In stabilised space noise std is
+# constant (measured: 3.08x spread -> 1.02x), so the loss balances properly.
+#
+# A checkpoint trained with this MUST be run with it. train.py writes the flag
+# into the checkpoint and run.py reads it back, so no manual step is needed.
+vst:
+  enabled: false
+  normalize: true          # rescale so f(0)=0 and f(1)=1, keeping the network
+                           # in the [0,1]-ish range its other hyperparameters
+                           # were tuned for. Affine, so stabilisation is intact.
 
 inference:
   batch_size: 8

@@ -80,10 +80,11 @@ def main() -> int:
                     help="Model width. Read from the checkpoint when omitted.")
     ap.add_argument("--levels", type=int, default=None,
                     help="U-Net depth. Inferred from the checkpoint when omitted.")
-    ap.add_argument("--tta", type=int, default=1, choices=[1, 4, 8],
-                    help="Test-time augmentation: 1 = off, 4 = rotations, "
-                         "8 = full dihedral group. Cost is linear; throughput "
-                         "is scored, so measure before enabling.")
+    ap.add_argument("--tta", type=int, default=1, choices=[1, 2, 4, 8],
+                    help="Test-time augmentation: 1 = off, 2 = identity+180deg, "
+                         "4 = rotations, 8 = full dihedral group. Cost is "
+                         "linear; throughput is scored, so measure before "
+                         "enabling.")
     args = ap.parse_args()
 
     in_dir = Path(args.input_dir)
@@ -146,6 +147,29 @@ def main() -> int:
         print(f"Loaded weights from: {active_weights_path}  (dim={dim}, {n_par/1e6:.2f}M params)")
     else:
         print(f"WARNING: no weights at {active_weights_path}. Running UNINITIALIZED!")
+
+    # A model trained in variance-stabilised space operates on a warped
+    # intensity scale and outputs garbage if fed raw pixels. The checkpoint
+    # records whether it needs the transform, so this is automatic - there is
+    # no flag for the evaluator to remember to set.
+    core = model
+    vst_cfg = sd.get("vst") if (state_dict is not None and isinstance(sd, dict)) else None
+    if vst_cfg:
+        from src.vst import VST
+        _vst = VST.from_dict(vst_cfg)
+        print(f"Checkpoint trained with VST -> applying: {_vst}")
+
+        class _VSTWrapped(torch.nn.Module):
+            """Presents an image-space interface around a stabilised-space model."""
+
+            def __init__(self, inner, transform):
+                super().__init__()
+                self.inner, self.t = inner, transform
+
+            def forward(self, x):
+                return self.t.inverse(self.inner(self.t.forward(x)))
+
+        model = _VSTWrapped(core, _vst).to(device).eval()
 
     # Load everything up front and group by shape so batches stay rectangular.
     t_start = time.perf_counter()
