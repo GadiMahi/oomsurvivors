@@ -172,10 +172,9 @@ def main() -> int:
         blocks=cfg.get_path("model.blocks", 2), 
         middle_blocks=cfg.get_path("model.middle_blocks", 2),
         non_local=cfg.get_path("model.non_local", False),
-        nl_heads=cfg.get_path("model.nl_heads", 2),
-        nl_kv_stride=cfg.get_path("model.nl_kv_stride", 2)
+        nl_heads=cfg.get_path("model.nl_heads", 4),
+        nl_window_size=cfg.get_path("model.nl_window_size", 8) 
     ).to(device)
-
     epochs = args.epochs or cfg.get_path("train.epochs", 80)
     lr0 = cfg.get_path("train.lr", 5e-4)
     opt = optim.AdamW(model.parameters(), lr=lr0, weight_decay=cfg.get_path("train.weight_decay", 1e-4))
