@@ -155,17 +155,52 @@ def main() -> int:
     root = Path(cfg.get_path("data.root"))
     gt_dir = root / cfg.get_path("data.gt_subdir", "GT")
     lr_dir = root / cfg.get_path("data.lr_subdir", "NoisyLR")
-    kernel = cfg.get_path("degrade.kernels", ["gauss:0.6"])[0]
-    if isinstance(kernel, str) and not kernel.startswith("gauss"):
-        kernel = "gauss:0.6"
+    # Use the IDENTIFIED kernel, not the first entry of the training jitter
+    # list. `degrade.kernels` is ["gauss:0.5", "gauss:0.6", "gauss:0.7"] - a
+    # deliberate spread for augmentation robustness - so element [0] is 0.5,
+    # which is not the kernel we measured.
+    from src.transforms import load_stats
+    kernel = load_stats().get("downsample_kernel", "gauss:0.6")
 
-    sp_path = Path("artifacts/splits.json")
-    if sp_path.exists():
-        stems = json.load(open(sp_path))[args.split][:args.images]
-    else:
-        stems = [p.stem for p in sorted(lr_dir.glob("*.npy"))[:args.images]]
-    print(f"images={len(stems)}  patch={args.patch}  k={args.k}  "
-          f"exclude={args.exclude}px  kernel={kernel}\n")
+    def resolve_stems():
+        """Prefer the split file, but only if it points at files that exist.
+
+        `artifacts/splits.json` may be the 8-image fixture written by
+        scripts/make_dummy_data.py rather than a real split, and the real one
+        lives in /kaggle/working, which does not survive a session restart.
+        Silently measuring three nonexistent images is worse than globbing.
+        """
+        sp = Path("artifacts/splits.json")
+        if sp.exists():
+            try:
+                cand = json.load(open(sp)).get(args.split) or []
+            except Exception:
+                cand = []
+            present = [s for s in cand if (lr_dir / f"{s}.npy").exists()]
+            if len(present) >= min(args.images, 5):
+                return present[:args.images], f"splits.json[{args.split}]"
+            if cand:
+                print(f"!! artifacts/splits.json lists {len(cand)} stems for "
+                      f"'{args.split}' but only {len(present)} exist under "
+                      f"{lr_dir}.\n   Falling back to a directory scan. To use "
+                      f"the real split run:\n     python scripts/make_splits.py "
+                      f"--set data.root={root}\n")
+        found = sorted(lr_dir.glob("*.npy"))
+        if not found:
+            raise FileNotFoundError(
+                f"No .npy files under {lr_dir}. Check data.root - currently "
+                f"{root}")
+        # Sample across the directory rather than taking a contiguous block,
+        # which would bias toward whatever content happens to sort first.
+        step = max(1, len(found) // max(args.images, 1))
+        return [p.stem for p in found[::step]][:args.images], "directory scan"
+
+    stems, source = resolve_stems()
+    print(f"images={len(stems)} (from {source})  patch={args.patch}  "
+          f"k={args.k}  exclude={args.exclude}px  kernel={kernel}\n")
+    if len(stems) < 5:
+        print("!! Fewer than 5 images. The result will be dominated by whatever "
+              "content those few frames happen to contain - raise --images.\n")
 
     rng = np.random.default_rng(args.seed)
 
@@ -194,7 +229,7 @@ def main() -> int:
         try:
             noisy, clean = load_pair(stem)
         except Exception as e:
-            print(f"  skip {stem}: {type(e).__name__}")
+            print(f"  skip {stem}: {type(e).__name__}: {e}")
             continue
 
         pn, pos = extract_patches(noisy, args.patch, args.stride)
@@ -233,7 +268,11 @@ def main() -> int:
             print(f"  {i + 1}/{len(stems)}")
 
     if n_px == 0:
-        print("no images processed")
+        print("\nNo images were processed - every load failed.\n"
+              f"  GT  dir: {gt_dir}  (exists: {gt_dir.is_dir()})\n"
+              f"  LR  dir: {lr_dir}  (exists: {lr_dir.is_dir()})\n"
+              "Check data.root, and confirm the GT/NoisyLR subdirectory names "
+              "match data.gt_subdir / data.lr_subdir in configs/default.yaml.")
         return 2
 
     # `null` starts one image late, so normalise it against its own count.

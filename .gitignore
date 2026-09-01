@@ -4,6 +4,14 @@ __pycache__/
 .DS_Store
 artifacts/cache/
 !artifacts/.gitkeep
+# Session-specific and regenerated from the data - committing these ships a
+# fixture that looks real. Both were accidentally committed as the 8-image
+# output of scripts/make_dummy_data.py, which silently reduced a 1,165-image
+# validation split to 3 nonexistent files.
+#   python scripts/make_splits.py   --set data.root=$DATA
+#   python scripts/run_inventory.py --set data.root=$DATA
+artifacts/splits.json
+artifacts/inventory.csv
 results/*.png
 results/*.csv
 data/
