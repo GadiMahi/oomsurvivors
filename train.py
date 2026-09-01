@@ -123,6 +123,21 @@ class SobelEdgeLoss(nn.Module):
         return w / w.mean(dim=(-2, -1), keepdim=True).clamp_min(1e-8)
 
 
+def gaussian_blur(x, sigma: float, kernel: int = 5):
+    """Separable Gaussian blur, no torchvision dependency.
+
+    Used for optional ground-truth smoothing - see `loss.gt_smooth_sigma`.
+    """
+    g = torch.arange(kernel, dtype=torch.float32, device=x.device) - (kernel - 1) / 2
+    g = torch.exp(-g.pow(2) / (2 * sigma ** 2))
+    g = (g / g.sum())
+    gx = g.view(1, 1, 1, -1)
+    gy = g.view(1, 1, -1, 1)
+    p = kernel // 2
+    x = F.conv2d(F.pad(x, (p, p, 0, 0), mode="reflect"), gx)
+    return F.conv2d(F.pad(x, (0, 0, p, p), mode="reflect"), gy)
+
+
 class MSSSIMLoss(nn.Module):
     """Multi-scale SSIM as a differentiable loss:  1 - MS-SSIM(pred, target).
 
@@ -358,6 +373,42 @@ def main() -> int:
         print(f"VST enabled: {vst}")
         print("   losses computed in stabilised space; metrics in image space")
 
+    # Stochastic weight averaging. Averages the weights of the last N epochs
+    # instead of picking one. This is an ERROR-REDUCTION method, which is the
+    # category that has consistently worked on this problem (real data volume,
+    # TTA, ensembling) as opposed to information-extraction methods (wider,
+    # deeper, spectral loss), which have consistently failed.
+    #
+    # Starting at epoch 36 is justified by the final run: epochs 36-50 all fell
+    # within 0.0008 SSIM of one another, so that is where the plateau begins and
+    # where averaging is meaningful rather than averaging over a trend.
+    swa_start = cfg.get_path("train.swa_start", 0)
+    swa_model = None
+    if swa_start:
+        from torch.optim.swa_utils import AveragedModel
+        swa_model = AveragedModel(model)
+        print(f"SWA enabled: averaging from epoch {swa_start}")
+
+    # Optional ground-truth smoothing. OFF by default, deliberately.
+    #
+    # The rationale for it is sound: the ground truth carries its own
+    # acquisition noise (measured tail flatness 0.024 above ~60% of maximum
+    # frequency), that noise is unpredictable by definition, and asking the
+    # model to reproduce it just adds gradient noise.
+    #
+    # The risk is that it bakes in the exact deficit we already measured. The
+    # model's output already matches GT blurred at sigma~1.1 some 4.3 dB better
+    # than raw GT, so smoothing the target at sigma 1.0 pushes it further in the
+    # direction that is already the problem - while evaluation is still against
+    # RAW GT. It is a hypothesis worth testing, not one to assume, so it is a
+    # flag with a measurable effect rather than an unconditional change.
+    # Start well below 1.0: sigma 0.3-0.5 removes the noise floor without
+    # removing structure.
+    gt_smooth = float(cfg.get_path("loss.gt_smooth_sigma", 0.0))
+    if gt_smooth > 0:
+        print(f"GT smoothing enabled: sigma={gt_smooth} "
+              f"(metrics still measured against RAW ground truth)")
+
     w_char = cfg.get_path("loss.charbonnier", 1.0)
     w_lpips = cfg.get_path("loss.lpips", 0.05)
     w_edge = cfg.get_path("loss.edge", 0.5)
@@ -402,18 +453,24 @@ def main() -> int:
                 lr, hr = cutblur_sr(lr, hr, scale=cfg.get_path("dataset.scale", 2),
                                     p=cutblur_p)
 
+            # Smooth the LOSS target only. `hr` itself stays untouched, because
+            # evaluation and every reported metric must use the raw ground truth
+            # - otherwise we would be scoring against an easier target than the
+            # one KLA scores against.
+            hr_t = gaussian_blur(hr, gt_smooth) if gt_smooth > 0 else hr
+
             opt.zero_grad(set_to_none=True)
             with torch.autocast("cuda", enabled=amp):
                 if vst is None:
                     pred = pred_img = model(lr)
-                    tgt = hr
+                    tgt = hr_t
                 else:
                     # Pixel-space losses go in STABILISED space, where the noise
                     # is homoscedastic - that is the entire point of the
                     # transform. Perceptual and structural losses go in IMAGE
                     # space, because LPIPS features and SSIM's constants are
                     # both calibrated for [0,1] intensities.
-                    tgt = vst.forward(hr)
+                    tgt = vst.forward(hr_t)
                     pred = model(vst.forward(lr))
                     pred_img = vst.inverse(pred)
 
@@ -421,9 +478,9 @@ def main() -> int:
                 l_char = charb(pred, tgt, wmap)
                 l_edge = sobel(pred, tgt)
                 l_perc = lpips_fn(pred_img.clamp(0, 1).repeat(1, 3, 1, 1) * 2 - 1,
-                                  hr.repeat(1, 3, 1, 1) * 2 - 1).mean()
+                                  hr_t.repeat(1, 3, 1, 1) * 2 - 1).mean()
                 l_spec = spectral(pred, tgt) if w_spec > 0 else pred.new_zeros(())
-                l_mss = (msssim(pred_img.clamp(0, 1), hr) if w_msssim > 0
+                l_mss = (msssim(pred_img.clamp(0, 1), hr_t) if w_msssim > 0
                          else pred.new_zeros(()))
                 loss = (w_char * l_char + w_edge * l_edge
                         + w_lpips * l_perc + w_spec * l_spec
@@ -468,7 +525,39 @@ def main() -> int:
                        out_dir / "best_nafnet.pt")
             print(f"   -> saved (best {cfg.get_path('train.select_metric', 'ssim')}={best:.4f})")
 
+        if swa_model is not None and ep >= swa_start:
+            swa_model.update_parameters(model)
+
     print(f"\nbest OOD {cfg.get_path('train.select_metric', 'ssim')} = {best:.4f}")
+
+    # SWA has to be MEASURED, not just saved. An averaged checkpoint that is
+    # never scored is a checkpoint nobody can justify submitting.
+    if swa_model is not None:
+        n_avg = int(getattr(swa_model, "n_averaged", 0))
+        if n_avg > 0:
+            print(f"\nevaluating SWA model ({n_avg} epochs averaged) ...")
+            m_swa = evaluate(swa_model.module, val_loader, device, lpips_fn, vst=vst)
+            sel = cfg.get_path("train.select_metric", "ssim")
+            print(f"SWA  psnr {m_swa['psnr']:.2f} ssim {m_swa['ssim']:.4f} "
+                  f"edge {m_swa['ssim_edge']:.4f} flat {m_swa['ssim_flat']:.4f} "
+                  f"lpips {m_swa['lpips']:.4f}")
+            print(f"best {sel}: single {best:.4f} vs SWA {m_swa[sel]:.4f} "
+                  f"({m_swa[sel] - best:+.4f})")
+            print("   -> SWA wins, submit it" if m_swa[sel] > best
+                  else "   -> single checkpoint wins, keep it")
+            swa_path = out_dir / "swa_nafnet.pt"
+            torch.save({"model": swa_model.module.state_dict(),
+                        "epoch": epochs, "best": m_swa[sel], "metrics": m_swa,
+                        "config": dict(cfg), "swa_epochs_averaged": n_avg,
+                        "vst": vst.to_dict() if vst is not None else None},
+                       swa_path)
+            print(f"   -> wrote {swa_path}")
+            history.append({"epoch": "swa", "n_averaged": n_avg, **m_swa})
+            with open(out_dir / "history.json", "w") as f:
+                json.dump(history, f, indent=2)
+        else:
+            print(f"\nSWA requested from epoch {swa_start} but training stopped "
+                  f"at {epochs} - nothing averaged.")
     print(f"checkpoint: {out_dir/'best_nafnet.pt'}   history: {out_dir/'history.json'}")
     return 0
 
