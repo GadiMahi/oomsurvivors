@@ -40,12 +40,15 @@ def main() -> int:
     from src.vst import VST, vst_from_stats
 
     print("\n[1] VST algebra")
-    try:
-        v = vst_from_stats()
-        print(f"       built from artifacts/stats.json: {v}")
-    except Exception as e:
-        print(f"       stats.json unavailable ({type(e).__name__}), using literals")
-        v = VST(0.023807, 0.010394, 0.0030539)
+    v = vst_from_stats()
+    print(f"       built from artifacts/stats.json: {v}")
+    # The literals below are the measured round-2 constants. If the transform
+    # silently fell back to them the test would still pass while checking
+    # nothing about the real fit, so assert they match instead.
+    ref = VST(0.023807, 0.010394, 0.0030539)
+    same = all(abs(getattr(v, k) - getattr(ref, k)) < 1e-9 for k in "abc")
+    check("constants match the recorded round-2 fit", same,
+          "" if same else f"a={v.a:.6g} b={v.b:.6g} c={v.c:.6g} - noise was refit?")
 
     y = torch.linspace(-0.5, 2.5, 200_001)
     rt = float((v.inverse(v.forward(y)) - y).abs().max())

@@ -188,7 +188,7 @@ def _sinh(x: Any) -> Any:
 def vst_from_stats(stats: dict | None = None, normalize: bool = True) -> VST:
     """Build the VST from the measured constants in artifacts/stats.json."""
     if stats is None:
-        from src.io_utils import load_stats
+        from src.transforms import load_stats
         stats = load_stats()
     fit = stats.get("noise_var_fit")
     if not fit:
