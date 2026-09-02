@@ -167,12 +167,19 @@ loss:
   lpips: 0.05           # too high and it fights pixel fidelity
   edge: 0.5
   edge_weight_alpha: 4.0   # per-pixel Charbonnier weighting toward structure
-  spectral: 0.0            # frequency-domain loss. 0 = off.
-                           # Measured: the dim96 model retained only 28% of the
-                           # ground truth's high-frequency power - it erased 72%
-                           # of fine texture while scoring well on PSNR/SSIM.
-                           # Try 0.1-0.5 and watch SSIM-flat, which is where SEM
-                           # texture lives (edge SSIM misses this failure).
+  spectral: 0.0            # frequency-domain loss. 0 = off. TESTED AND REJECTED.
+                           # The motivation was sound: the dim96 model retained
+                           # only 28% of the ground truth's high-frequency power.
+                           # Run 5 set this to 3.0 and the result was:
+                           #     PSNR  23.46  (baseline 23.94)
+                           #     SSIM  0.4899 (baseline 0.5034)
+                           #     LPIPS 0.3699 (baseline 0.3655)
+                           # Worse on every metric. HF retention did rise to 72%,
+                           # but the images looked no better - it added
+                           # high-frequency ENERGY without high-frequency
+                           # STRUCTURE. Matching FFT magnitude manufactures grain
+                           # that corresponds to nothing.
+                           # Do not re-run this expecting it to fix blur.
   spectral_hi_from: 0.25   # only penalise the upper 75% of the spectrum
   gt_smooth_sigma: 0.0     # Gaussian blur applied to the LOSS TARGET only. 0 = off.
                            # Rationale: the ground truth carries its own
