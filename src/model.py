@@ -101,16 +101,73 @@ class NAFBlock(nn.Module):
         return identity2 + out * self.gamma
 
 
-class NonLocalBlock(nn.Module):
+class GlobalNonLocalBlock(nn.Module):
+    """Full self-attention over the feature map, with pooled keys/values.
+
+    Every position attends to EVERY other, which is the point. The redundancy
+    we measured is spread across the whole frame:
+
+        single noisy patch                    20.08 dB
+        average of 16 spatial neighbours      21.54 dB   (+1.46)
+        average of 16 MATCHED patches         23.42 dB   (+3.34)
+        average of 16 patches, OTHER image    18.09 dB   (-1.99)   <- control
+
+    and `scripts/measure_recurrence.py` required matches to sit at least 12px
+    away, so the gain is specifically NON-local. See docs/NONLOCAL_HANDOFF.md.
+
+    `kv_stride` pools keys and values so cost grows as HW x HW/stride^2 rather
+    than (HW)^2, and SDPA never materialises the attention matrix - together
+    that keeps a 512px input affordable without giving up global reach.
+
+    `gamma` is zero-initialised, so the block starts as an exact identity.
+    """
+
+    def __init__(self, channels: int, heads: int = 4, kv_stride: int = 2):
+        super().__init__()
+        if channels % heads:
+            heads = 1
+        self.heads = heads
+        self.kv_stride = kv_stride
+        self.norm = LayerNorm2d(channels)
+        self.to_q = nn.Conv2d(channels, channels, 1, bias=False)
+        self.to_kv = nn.Conv2d(channels, channels * 2, 1, bias=False)
+        self.proj = nn.Conv2d(channels, channels, 1)
+        self.gamma = nn.Parameter(torch.zeros(1, channels, 1, 1))
+
+    def forward(self, x):
+        b, c, h, w = x.shape
+        y = self.norm(x)
+        q = self.to_q(y)
+        src = (F.avg_pool2d(y, self.kv_stride)
+               if self.kv_stride > 1 and min(h, w) >= 2 * self.kv_stride else y)
+        k, v = self.to_kv(src).chunk(2, dim=1)
+
+        def heads_first(t):
+            bb, cc, hh, ww = t.shape
+            return t.reshape(bb, self.heads, cc // self.heads,
+                             hh * ww).transpose(-2, -1)
+
+        o = F.scaled_dot_product_attention(heads_first(q), heads_first(k),
+                                           heads_first(v))
+        o = o.transpose(-2, -1).reshape(b, c, h, w)
+        return x + self.gamma * self.proj(o)
+
+
+class WindowedNonLocalBlock(nn.Module):
     """Swin-Style Windowed Multi-Head Self-Attention.
 
-    Replaces the baseline global strided attention. By partitioning the feature 
-    map into non-overlapping windows (e.g., 8x8), computational complexity drops 
-    from O((HW)^2) to O(HW * M^2). 
+    Partitions the feature map into non-overlapping windows (e.g. 8x8), so
+    complexity drops from O((HW)^2) to O(HW * M^2).
 
-    To allow cross-window spatial frame averaging, alternating blocks use a 
-    cyclic shift. Because SEM textures are homogeneous and stationary, we allow 
-    toroidal edge-wrapping (unmasked) to avoid the latency hit of attention masks.
+    CAVEAT worth measuring before preferring this to the global variant: at
+    levels=2 the bottleneck is 32x32 for a 128px input, so an 8x8 window spans
+    about 32px in input coordinates - comparable to the ~60px the convolutions
+    already reach. The recurrence measurement that motivated attention required
+    matches at least 12px away and found the benefit spread across the whole
+    frame, which a window this size cannot see. The cyclic shift propagates
+    information across windows only over DEPTH, and there is a single non-local
+    block in the stack, so with one block the shift has nothing to alternate
+    with. Run both and compare rather than assuming the cheaper one is equivalent.
     """
 
     def __init__(self, channels: int, heads: int = 4, window_size: int = 8, shift_size: int = 0):
@@ -120,7 +177,7 @@ class NonLocalBlock(nn.Module):
         self.heads = heads
         self.window_size = window_size
         self.shift_size = shift_size
-        
+
         self.norm = LayerNorm2d(channels)
         self.to_qkv = nn.Conv2d(channels, channels * 3, 1, bias=False)
         self.proj = nn.Conv2d(channels, channels, 1)
@@ -175,10 +232,28 @@ class NonLocalBlock(nn.Module):
         return x + self.gamma * self.proj(o)
 
 
+def NonLocalBlock(channels, heads=4, mode="global", kv_stride=2,
+                  window_size=8, shift_size=0):
+    """Dispatch to the global or windowed attention block.
+
+    Both are kept so the choice can be measured rather than assumed. `global`
+    is the default because it is what the recurrence measurement justifies;
+    `window` is cheaper and worth checking against it.
+    """
+    if mode == "window":
+        return WindowedNonLocalBlock(channels, heads=heads,
+                                     window_size=window_size,
+                                     shift_size=shift_size)
+    if mode != "global":
+        raise ValueError(f"nl_mode must be 'global' or 'window', got {mode!r}")
+    return GlobalNonLocalBlock(channels, heads=heads, kv_stride=kv_stride)
+
+
 class NAFNet_UNet(nn.Module):
     def __init__(self, in_channels=1, out_channels=1, dim=64, scale=2,
                  levels=1, blocks=2, middle_blocks=2,
-                 non_local=False, nl_heads=4, nl_window_size=8):
+                 non_local=False, nl_heads=4, nl_mode='global',
+                 nl_kv_stride=2, nl_window_size=8):
         super().__init__()
         self.scale = scale
         self.levels = levels
@@ -202,7 +277,10 @@ class NAFNet_UNet(nn.Module):
             if self.non_local:
                 # Alternate shift sizes (0 then window_size // 2) for cross-window matching
                 shift = (nl_window_size // 2) if (i % 2 == 1) else 0
-                mid.append(NonLocalBlock(c, heads=nl_heads, window_size=nl_window_size, shift_size=shift))
+                mid.append(NonLocalBlock(c, heads=nl_heads, mode=nl_mode,
+                                         kv_stride=nl_kv_stride,
+                                         window_size=nl_window_size,
+                                         shift_size=shift))
         self.middle = nn.Sequential(*mid)
 
         # ---- decoder ----------------------------------------------------
@@ -277,12 +355,14 @@ def is_legacy_state_dict(sd: dict) -> bool:
 
 @register("nafnet")
 def _nafnet(scale=2, dim=64, levels=1, blocks=2, middle_blocks=2,
-            non_local=False, nl_heads=4, nl_window_size=8, **kwargs):
+            non_local=False, nl_heads=4, nl_mode='global',
+            nl_kv_stride=2, nl_window_size=8, **kwargs):
     """Width AND depth are configurable so both can be swept."""
     return NAFNet_UNet(in_channels=1, out_channels=1, dim=int(dim), scale=scale,
                        levels=int(levels), blocks=int(blocks),
                        middle_blocks=int(middle_blocks),
                        non_local=bool(non_local), nl_heads=int(nl_heads),
+                       nl_mode=str(nl_mode), nl_kv_stride=int(nl_kv_stride),
                        nl_window_size=int(nl_window_size))
 
 
