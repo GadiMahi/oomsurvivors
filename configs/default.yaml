@@ -125,6 +125,19 @@ model:
   # Attention is detected from the checkpoint, so run.py needs no flag.
   non_local: false
   nl_heads: 4
+  nl_mode: global        # 'global' or 'window'.
+                         # global : every position attends to every other. This
+                         #   is what the recurrence measurement justifies - it
+                         #   required matches at least 12px away and found the
+                         #   benefit spread across the whole frame.
+                         # window : Swin-style 8x8 windows. Cheaper, but at
+                         #   levels=2 an 8x8 bottleneck window spans only ~32px
+                         #   in input coordinates, which is LESS than the ~60px
+                         #   the convolutions already reach. The cyclic shift
+                         #   only moves information across windows over DEPTH,
+                         #   and there is one non-local block, so it has nothing
+                         #   to alternate with. Measure both before choosing.
+  nl_window_size: 8      # only used when nl_mode=window
   nl_kv_stride: 2        # pool keys/values by this factor. 1 = full attention
                          # (accurate, but memory grows with the square of the
                          # pixel count and 512px inputs become a problem).

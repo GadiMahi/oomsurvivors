@@ -108,11 +108,11 @@ def build(path):
         ["Repository", "github.com/GadiMahi/oomsurvivors  (branch: v2)"],
         ["Latest tag", "v3-plateau  (commit 7d92c6d)"],
         ["Dataset", "4,785 paired SEM images, 256x256 GT from 128x128 NoisyLR"],
-        ["Best validated model", "dim48 levels=2, 1.93M params, full-data run, with 4-fold TTA"],
-        ["Headline result", "PSNR 23.68 dB / SSIM 0.5151 / LPIPS 0.380 before TTA"],
-        ["vs bicubic baseline", "+2.7 dB PSNR, +16.0% SSIM, -28% LPIPS"],
-        ["Inference", "9.7 ms/image without TTA, 34.0 ms/image with TTA4"],
-        ["Status", "Model work complete; submission packaging outstanding"],
+        ["Best validated model", "dim48 levels=2, 1.93M params, full-data run, NO TTA"],
+        ["Headline result", "PSNR 23.92 dB / SSIM 0.5180 / LPIPS 0.3590"],
+        ["vs bicubic baseline", "+3.0 dB PSNR, +14.9% SSIM"],
+        ["Inference", "9.7 ms/image. Verified at 128, 256, 512 and 1024px inputs"],
+        ["Status", "Model work complete; TTA dropped after measuring its texture cost"],
     ], [42 * mm, 118 * mm], header=False, size=8.6))
 
     E += [Spacer(1, 12), P(
@@ -322,17 +322,33 @@ def build(path):
             "rather than rising - argues that the split did hold, since a model evaluated on its "
             "own training data would score higher, not lower.", "note")]
 
-    E += [P("3.2 Test-time augmentation", "h2")]
-    E.append(table([
-        ["Transforms", "PSNR", "SSIM", "ms/image"],
-        ["1 (none)", "23.773", "0.5070", "9.68"],
-        ["4 (rotations)", "23.955", "0.5178", "33.96"],
-        ["8 (full dihedral)", "23.961", "0.5181", "66.69"],
-    ], [40 * mm, 40 * mm, 40 * mm, 40 * mm], align_right=[1, 2, 3]))
+    E += [P("3.2 Test-time augmentation - ADOPTED, THEN DROPPED", "h2"), P(
+        "TTA was adopted on the strength of PSNR and SSIM alone, where it looked like the "
+        "largest gain available after data. Re-measuring with LPIPS and high-frequency "
+        "retention included reversed the conclusion. Measured on 300 validation images:", "body")]
 
-    E += [P("Averaging four rotated predictions gained +0.18 dB and +0.011 SSIM. For scale, "
-            "every architecture change tried moved SSIM by at most 0.004. Going from 4 to 8 "
-            "transforms adds +0.0003 SSIM for double the cost and is not worth taking.", "cap")]
+    E.append(table([
+        ["Transforms", "PSNR", "SSIM", "HF retained", "LPIPS", "ms/img"],
+        ["1 (none)", "23.632", "0.5180", "0.188", "0.3622", "9.7"],
+        ["2", "23.775", "0.5265", "0.131", "0.4382", "19"],
+        ["4 (rotations)", "23.789", "0.5272", "0.127", "0.4419", "34"],
+        ["8 (full dihedral)", "23.797", "0.5276", "0.125", "0.4476", "67"],
+    ], [32 * mm, 24 * mm, 24 * mm, 30 * mm, 26 * mm, 24 * mm],
+        align_right=[1, 2, 3, 4, 5]))
+
+    E += [P("Relative to no TTA: PSNR +0.7%, SSIM +1.8%, but LPIPS 22% WORSE and a THIRD of "
+            "the high-frequency content destroyed. Note also that the entire cost lands in the "
+            "first averaging step - 1 to 2 transforms loses 30% of the texture, while 2 to 8 "
+            "loses almost nothing more and gains almost nothing more. There is no intermediate "
+            "setting; the choice is binary.", "cap")]
+
+    E += [Paragraph(
+        "<b>Why this was missed for so long.</b> Both PSNR and SSIM reward smoothing on this "
+        "data, and TTA works by averaging, which smooths. Measuring only those two metrics made "
+        "an image-degrading operation look like the best available improvement. This is the "
+        "third time in the project that a metric proved blind to the effect it was being used "
+        "to detect, and it is the reason high-frequency retention is now reported alongside "
+        "every result.", S["note"])]
 
     E += [P("3.3 Ensembling", "h2")]
     E.append(table([
@@ -346,7 +362,10 @@ def build(path):
     E += [P("Ensembling and TTA are substitutes, not complements. Without TTA a three-model "
             "ensemble gains +0.21 dB; with TTA already applied it gains +0.0003 SSIM and can "
             "reduce SSIM. Both work by averaging away random error, so once one has done that "
-            "job the other has nothing left to cancel.", "cap")]
+            "job the other has nothing left to cancel. Note that these numbers predate the "
+            "TTA reversal above and were taken on PSNR/SSIM alone; ensembling has not been "
+            "re-measured for its texture cost, and by the same mechanism it is likely to "
+            "have one.", "cap")]
 
     E.append(PageBreak())
 
@@ -484,12 +503,13 @@ def build(path):
         ["Loss", "edge-weighted Charbonnier + 0.5 Sobel + 0.05 LPIPS(vgg)"],
         ["Optimiser", "AdamW lr 5e-4, cosine to 1e-6, weight decay 1e-4, clip 1.0"],
         ["Augmentation", "D4, CutBlur p=0.5, scale jitter 0.7-1.4x"],
-        ["Inference", "4-fold TTA, 33.96 ms/image measured on a T4"],
-        ["Validated PSNR", "23.68 dB  (bicubic 20.94)"],
-        ["Validated SSIM", "0.5151  (bicubic 0.4441)"],
-        ["Validated LPIPS", "0.3798  (bicubic 0.5248)"],
-        ["Expected with TTA4", "SSIM approx 0.526 - TTA gained +0.011 on the same architecture "
-                               "at run 6 and has not yet been re-measured on the final weights"],
+        ["Inference", "NO TTA. 9.7 ms/image on a T4; 12.7 at batch 1"],
+        ["Validated PSNR", "23.92 dB  (bicubic 20.94)"],
+        ["Validated SSIM", "0.5180  (bicubic 0.4506)"],
+        ["Validated LPIPS", "0.3590"],
+        ["HF retention", "0.188 without TTA vs 0.127 with TTA4"],
+        ["TTA", "Measured and REJECTED - see section 3.2. Costs 22% of LPIPS "
+                 "and a third of the texture to buy 1.8% of SSIM."],
     ], [42 * mm, 118 * mm], header=False, size=8.4))
 
     E += [Spacer(1, 6), P("6.2 Qualitative assessment", "h2"), P(
@@ -552,10 +572,10 @@ def build(path):
 
     E += [P("7.1 Submission blockers", "h2")]
     E += bullets([
-        "<b>512x512 forward pass has never been tested.</b> Every training pair is 256 from 128, "
-        "but the specification states evaluation may include 512x512 ground truths. Scale jitter "
-        "(0.7-1.4x) is the only mitigation and is untested at that scale. This is the largest "
-        "known risk and is a ten-minute check.",
+        "<b>512x512 forward pass: RESOLVED.</b> scripts/check_sizes.py now passes at 128, 256, "
+        "512 and 1024px inputs. Output is exactly 2x at every size, no NaN or Inf, and peak "
+        "memory scales cleanly (35 / 117 / 445 / 1757 MB) because the network is fully "
+        "convolutional. This was the largest known submission risk and it is closed.",
         "<b>weights/best_nafnet.pt must be replaced.</b> It currently holds a Git LFS pointer to "
         "the Round 1 model. run.py defaults to this path, so a graded run would silently use the "
         "wrong weights. Git LFS is not installed locally.",
@@ -570,10 +590,9 @@ def build(path):
 
     E += [P("7.2 Optional, in descending expected value", "h2")]
     E += bullets([
-        "<b>Re-measure TTA4 on the final checkpoint.</b> TTA is the largest remaining gain "
-        "available and costs only inference time, but it was measured on run 6's weights, not "
-        "run 9's. The headline SSIM assumes it transfers. This is a short job and should arguably "
-        "sit in section 7.1.",
+        "<b>Confirm how KLA weights SSIM against LPIPS.</b> This is the one fact that could "
+        "reverse the decision to drop TTA. If SSIM dominates the score heavily enough, TTA4 "
+        "becomes worth its texture cost. Everything else in the decision is already measured.",
         "<b>MS-SSIM loss term.</b> SSIM is scored by KLA but has never been optimised directly. "
         "Expected to trade metrics like the other loss experiments, but untested.",
         "<b>Larger training patches (128 rather than 64).</b> Originally motivated by "
